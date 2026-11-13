@@ -31,6 +31,8 @@ pub use crate::gmail_push::GmailPushChannel;
 pub use crate::imessage::IMessageChannel;
 #[cfg(feature = "channel-irc")]
 pub use crate::irc::IrcChannel;
+#[cfg(feature = "channel-kimi-claw")]
+pub use crate::kimi_claw::KimiClawChannel;
 #[cfg(feature = "channel-lark")]
 pub use crate::lark::LarkChannel;
 #[cfg(feature = "channel-line")]
@@ -2187,6 +2189,12 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Be concise and direct\n\
              - Use Markdown text; the channel sends progressive draft updates when enabled\n\
              - Do not use local attachment markers; outbound image payloads are not supported yet.\n",
+        ),
+        "kimi_claw" | "kimi-claw" | "kimiclaw" => Some(
+            "When responding on Kimi Claw:\n\
+             - Be concise and direct\n\
+             - Use Markdown text; the Kimi IM channel currently sends a single text reply\n\
+             - Do not use local attachment markers; outbound files are not supported yet.\n",
         ),
         _ => None,
     }
@@ -13173,7 +13181,7 @@ impl std::fmt::Display for UnknownChannelId {
         write!(
             f,
             "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
-            signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
+            signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, kimi_claw, nextcloud_talk, \
             linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
         )
     }
@@ -13597,6 +13605,30 @@ fn build_channel_by_id(
         #[cfg(not(feature = "channel-dingtalk"))]
         "dingtalk" => {
             anyhow::bail!("DingTalk channel requires the `channel-dingtalk` feature");
+        }
+        #[cfg(feature = "channel-kimi-claw")]
+        id if is_kimi_claw_channel_id(id) => {
+            let alias = kimi_claw_alias_from_id(id);
+            let kc = config
+                .channels
+                .kimi_claw
+                .get(&alias)
+                .with_context(|| format!("Kimi Claw channel '{alias}' is not configured"))?;
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("kimi_claw", &alias))
+            };
+            Ok(Arc::new(
+                KimiClawChannel::new(kc.token.clone(), alias, peer_resolver)
+                    .with_api_host(kc.api_host.clone())
+                    .with_user_id(kc.user_id.clone())
+                    .with_proxy_url(kc.proxy_url.clone()),
+            ))
+        }
+        #[cfg(not(feature = "channel-kimi-claw"))]
+        id if is_kimi_claw_channel_id(id) => {
+            anyhow::bail!("Kimi Claw channel requires the `channel-kimi-claw` feature");
         }
         #[cfg(feature = "channel-wecom")]
         "wecom" => {
@@ -14102,6 +14134,21 @@ struct ConfiguredChannel {
 #[cfg(feature = "channel-wecom-ws")]
 pub(crate) fn wecom_ws_external_peers(config: &Config, alias: &str) -> Vec<String> {
     config.channel_external_peers_for(&["wecom-ws", "wecom_ws"], alias)
+}
+
+fn is_kimi_claw_channel_id(channel_id: &str) -> bool {
+    matches!(channel_id, "kimi_claw" | "kimi-claw" | "kimiclaw")
+        || channel_id.starts_with("kimi_claw.")
+        || channel_id.starts_with("kimi-claw.")
+        || channel_id.starts_with("kimiclaw.")
+}
+
+fn kimi_claw_alias_from_id(channel_id: &str) -> String {
+    channel_id
+        .split_once('.')
+        .map(|(_, alias)| alias.to_string())
+        .filter(|alias| !alias.is_empty())
+        .unwrap_or_else(|| "default".to_string())
 }
 
 /// Fold constructed channel plugins into the configured-channel set.
@@ -15751,6 +15798,52 @@ fn collect_configured_channels_with_authority(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "DingTalk channel is configured but this build was compiled without \
              `channel-dingtalk`; skipping DingTalk."
+        );
+    }
+
+    #[cfg(feature = "channel-kimi-claw")]
+    for (alias, kc) in &config.channels.kimi_claw {
+        if !active_channel_aliases.contains(&format!("kimi_claw.{alias}"))
+            && !active_channel_aliases.contains(&format!("kimi-claw.{alias}"))
+        {
+            continue;
+        }
+        if !kc.enabled {
+            continue;
+        }
+        if kc.token.trim().is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Kimi Claw channel is enabled but token is empty; skipping."
+            );
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("kimi_claw", &alias))
+        };
+        channels.push(ConfiguredChannel {
+            display_name: "Kimi Claw",
+            alias: Some(alias.clone()),
+            channel: Arc::new(
+                KimiClawChannel::new(kc.token.clone(), alias.clone(), peer_resolver)
+                    .with_api_host(kc.api_host.clone())
+                    .with_user_id(kc.user_id.clone())
+                    .with_proxy_url(kc.proxy_url.clone()),
+            ),
+        });
+    }
+
+    #[cfg(not(feature = "channel-kimi-claw"))]
+    if !config.channels.kimi_claw.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Kimi Claw channel is configured but this build was compiled without              `channel-kimi-claw`; skipping Kimi Claw."
         );
     }
 
@@ -57526,6 +57619,9 @@ Done."#;
             "wecom",
             "wecom_ws",
             "wecom-ws",
+            "kimi_claw",
+            "kimi-claw",
+            "kimiclaw",
             "nostr",
             "clawdtalk",
             "reddit",

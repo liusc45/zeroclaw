@@ -100,6 +100,7 @@ pub enum ChannelKind {
     #[strum(serialize = "imessage")]
     IMessage,
     Irc,
+    KimiClaw,
     Lark,
     Line,
     Linq,
