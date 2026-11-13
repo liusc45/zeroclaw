@@ -56,6 +56,8 @@ pub mod gmail_push;
 pub mod imessage;
 #[cfg(feature = "channel-irc")]
 pub mod irc;
+#[cfg(feature = "channel-kimi-claw")]
+pub mod kimi_claw;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
 #[cfg(feature = "channel-line")]

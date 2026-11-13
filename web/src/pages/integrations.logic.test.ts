@@ -21,6 +21,7 @@ test('chat channels route on the ChannelsConfig map key', () => {
   assert.equal(configHref('NextCloud Talk', 'Chat', 'nextcloud_talk'), '/config/channels/nextcloud_talk');
   assert.equal(configHref('Gmail Push', 'Chat', 'gmail_push'), '/config/channels/gmail_push');
   assert.equal(configHref('WeCom WebSocket', 'Chat', 'wecom_ws'), '/config/channels/wecom_ws');
+  assert.equal(configHref('Kimi Claw', 'Chat', 'kimi_claw'), '/config/channels/kimi_claw');
 });
 
 test('entries without a config key fall back to the bare section', () => {

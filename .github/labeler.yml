@@ -233,6 +233,11 @@
           - "src/channels/webhook.rs"
           - "crates/zeroclaw-channels/src/webhook.rs"
 
+"channel:kimi-claw":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-channels/src/kimi_claw.rs"
+
 "channel:wecom":
   - changed-files:
       - any-glob-to-any-file:

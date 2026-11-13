@@ -114,6 +114,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-wecom-ws"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Kimi Claw"),
+        type_keys: &["kimi-claw", "kimi_claw", "kimiclaw"],
+        compiled: cfg!(feature = "channel-kimi-claw"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("WeChat"),
         type_keys: &["wechat"],
         compiled: cfg!(feature = "channel-wechat"),
