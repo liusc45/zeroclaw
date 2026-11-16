@@ -83,21 +83,7 @@ Inbound sender IDs may also come from a [peer group](./peer-groups.md) whose `ch
 
 ## Kimi Claw
 
-Kimi Claw is Moonshot's chat surface on [kimi.com](https://kimi.com/bot). Officially it only documents linking an existing **OpenClaw** instance through the `kimi-claw` plugin (`im_rpc`). This ZeroClaw channel is a native port of that IM RPC protocol so a self-hosted ZeroClaw agent can talk with users on kimi.com without a Node bridge.
-
-It is off by default and compiled behind `channel-kimi-claw` (included in `channels-full`). Add a token from Kimi's "Link Existing OpenClaw" flow under `[channels.kimi_claw.<alias>]`:
-
-```toml
-[channels.kimi_claw.default]
-enabled = true
-token = "your-kimi-bot-token"
-# Optional: override the production IM host.
-# api_host = "https://www.kimi.com/api-claw"
-```
-
-The channel authenticates with `X-Kimi-Bot-Token`, subscribes to `/kimi.gateway.im.v1.IMService/Subscribe` using Buf Connect JSON envelopes, and replies with unary `SendMessage` requests. Streaming drafts, file uploads, the deprecated `bridge_ws` transport, and terminal/ACP ingress are not part of this first port.
-
-Authorize senders with a [peer group](./peer-groups.md) bound to `kimi_claw` (or `kimi-claw`). An empty peer group allows all senders.
+Kimi Claw (kimi.com) is a native channel included in default builds. See the dedicated [Kimi Claw](./kimi-claw.md) guide.
 
 ## DingTalk
 

@@ -183,6 +183,7 @@ default-channels = [
   "channel-discord",
   "channel-email",
   "channel-filesystem",
+  "channel-kimi-claw",
   "channel-telegram",
   "channel-webhook",
 ]

@@ -132,12 +132,24 @@ impl KimiClawChannel {
         )
     }
 
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        let peers = (self.peer_resolver)();
-        if peers.is_empty() {
-            return true;
+    /// Deny-by-default, like Telegram: a sender is admitted only by a peer
+    /// group bound to this channel (use `*` to admit everyone). Both the
+    /// stable `senderId` and the human `senderShortId` are matched together.
+    fn is_sender_allowed(&self, sender_id: &str, short_id: Option<&str>) -> bool {
+        let peers: Vec<String> = (self.peer_resolver)()
+            .into_iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let mut identities = vec![sender_id];
+        if let Some(short) = short_id.filter(|s| !s.is_empty()) {
+            identities.push(short);
         }
-        crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
+        crate::allowlist::is_identity_allowed(
+            &peers,
+            &identities,
+            crate::allowlist::Match::Sensitive,
+        )
     }
 
     fn version_header_value() -> String {
@@ -413,7 +425,7 @@ impl KimiClawChannel {
         meta: InboundMessage,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
-        if !self.is_user_allowed(&meta.sender_id) {
+        if !self.is_sender_allowed(&meta.sender_id, meta.sender_short_id.as_deref()) {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -1163,6 +1175,18 @@ mod tests {
             channel.mark_seen(&format!("x{i}"));
         }
         assert!(channel.mark_seen("m1"));
+    }
+
+    #[test]
+    fn senders_are_denied_without_a_peer_group() {
+        let closed = KimiClawChannel::new("t".into(), "default", Arc::new(Vec::new));
+        assert!(!closed.is_sender_allowed("u1", Some("ada")));
+        let open = KimiClawChannel::new("t".into(), "default", Arc::new(|| vec!["*".to_string()]));
+        assert!(open.is_sender_allowed("u1", None));
+        let by_short =
+            KimiClawChannel::new("t".into(), "default", Arc::new(|| vec!["ada".to_string()]));
+        assert!(by_short.is_sender_allowed("u1", Some("ada")));
+        assert!(!by_short.is_sender_allowed("u2", Some("bob")));
     }
 
     #[test]

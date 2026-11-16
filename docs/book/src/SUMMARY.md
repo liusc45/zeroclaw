@@ -95,6 +95,7 @@
   - [Peer Groups](./channels/peer-groups.md)
   - [Matrix](./channels/matrix.md)
   - [Telegram](./channels/telegram.md)
+  - [Kimi Claw](./channels/kimi-claw.md)
   - [Discord](./channels/discord.md)
   - [Slack](./channels/slack.md)
   - [Mattermost](./channels/mattermost.md)
