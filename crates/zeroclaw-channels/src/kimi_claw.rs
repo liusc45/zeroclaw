@@ -12,6 +12,19 @@
 //! - Subscribe: Buf Connect streaming JSON POST to
 //!   `/kimi.gateway.im.v1.IMService/Subscribe`
 //! - Send: unary JSON POST to `/kimi.gateway.im.v1.IMService/SendMessage`
+//! - Content fetch: subscribe events only carry metadata (`ChatMessageEvent`
+//!   has ids, status, role and a summary, not blocks), so the text of each
+//!   completed user message is read with unary `ListMessages` scoped to that
+//!   message id, exactly like the plugin's inbound handler.
+//!
+//! Resilience (mirrors `ImSubscribeRuntime`):
+//! - resume with `sinceId` = last processed `Event.id` after a reconnect;
+//! - the server pings about every 10 s, so a 30 s silence forces a reconnect;
+//! - a server `reconnect` event reconnects immediately, without backoff;
+//! - exponential backoff with jitter, 1 s up to 300 s, reset by the first
+//!   ping of a healthy stream;
+//! - only `STATUS_COMPLETED` chat events are dispatched, and recent message
+//!   ids are de-duplicated so a replay after resume never runs a turn twice.
 //!
 //! Out of scope for this first native port: terminal/shell/ACP ingress,
 //! `SendMessageStream`, file upload, and the deprecated `bridge_ws`
@@ -20,8 +33,9 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
@@ -37,13 +51,20 @@ pub const CONNECT_PROTOCOL_VERSION: &str = "1";
 pub const DEFAULT_CHAT_HEADER: &str = "x-kimi-claw-default-chat";
 pub const SUBSCRIBE_PATH: &str = "/kimi.gateway.im.v1.IMService/Subscribe";
 pub const SEND_MESSAGE_PATH: &str = "/kimi.gateway.im.v1.IMService/SendMessage";
+pub const LIST_MESSAGES_PATH: &str = "/kimi.gateway.im.v1.IMService/ListMessages";
 const CONNECT_FLAG_COMPRESSED: u8 = 1;
 const CONNECT_FLAG_END_STREAM: u8 = 2;
 const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 const CONNECT_STREAMING_JSON_CONTENT_TYPE: &str = "application/connect+json; charset=utf-8";
 const CONNECT_ACCEPT: &str = "application/connect+json";
 const DEFAULT_RETRY_BASE: Duration = Duration::from_millis(1_000);
-const DEFAULT_RETRY_MAX: Duration = Duration::from_millis(60_000);
+const DEFAULT_RETRY_MAX: Duration = Duration::from_millis(300_000);
+/// The plugin expects a server ping every ~10 s and reconnects after 30 s.
+const PING_TIMEOUT: Duration = Duration::from_secs(30);
+/// Unary RPC timeout (plugin uses 15-20 s per method).
+const UNARY_TIMEOUT: Duration = Duration::from_secs(20);
+/// How many recent inbound message ids are remembered for de-duplication.
+const SEEN_CAPACITY: usize = 512;
 
 /// A ZeroClaw channel bound to one `[channels.kimi_claw.<alias>]` instance.
 pub struct KimiClawChannel {
@@ -54,7 +75,12 @@ pub struct KimiClawChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     proxy_url: Option<String>,
     last_chat_id: Arc<RwLock<Option<String>>>,
+    /// Last processed subscribe `Event.id`, sent back as `sinceId`.
+    last_event_id: Arc<RwLock<Option<String>>>,
+    seen_message_ids: Mutex<VecDeque<String>>,
     subscribe_healthy: AtomicBool,
+    /// Set when the current stream delivered a ping; resets backoff.
+    saw_ping: AtomicBool,
 }
 
 impl KimiClawChannel {
@@ -71,7 +97,10 @@ impl KimiClawChannel {
             peer_resolver,
             proxy_url: None,
             last_chat_id: Arc::new(RwLock::new(None)),
+            last_event_id: Arc::new(RwLock::new(None)),
+            seen_message_ids: Mutex::new(VecDeque::with_capacity(SEEN_CAPACITY)),
             subscribe_healthy: AtomicBool::new(false),
+            saw_ping: AtomicBool::new(false),
         }
     }
 
@@ -195,6 +224,7 @@ impl Channel for KimiClawChannel {
             .http_client()
             .post(&url)
             .headers(self.auth_headers(false))
+            .timeout(UNARY_TIMEOUT)
             .json(&request)
             .send()
             .await?;
@@ -221,22 +251,36 @@ impl Channel for KimiClawChannel {
 
         let mut backoff = DEFAULT_RETRY_BASE;
         loop {
-            match self.subscribe_once(&tx).await {
-                Ok(()) => {
-                    self.subscribe_healthy.store(false, Ordering::Relaxed);
-                    backoff = DEFAULT_RETRY_BASE;
+            self.saw_ping.store(false, Ordering::Relaxed);
+            let result = self.subscribe_once(&tx).await;
+            self.subscribe_healthy.store(false, Ordering::Relaxed);
+            if self.saw_ping.load(Ordering::Relaxed) {
+                backoff = DEFAULT_RETRY_BASE;
+            }
+            match result {
+                Ok(SubscribeEnd::ServerReconnect) => {
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "kimi claw server requested reconnect"
+                    );
+                    continue;
+                }
+                Ok(end) => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "reason": end.as_str(),
+                                "backoff_ms": backoff.as_millis(),
+                            })),
                         "kimi claw subscribe stream ended; reconnecting"
                     );
                 }
                 Err(err) if is_auth_failure(&err) => {
-                    self.subscribe_healthy.store(false, Ordering::Relaxed);
                     return Err(err);
                 }
                 Err(err) => {
-                    self.subscribe_healthy.store(false, Ordering::Relaxed);
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -249,7 +293,7 @@ impl Channel for KimiClawChannel {
                     );
                 }
             }
-            tokio::time::sleep(backoff).await;
+            tokio::time::sleep(with_jitter(backoff)).await;
             backoff = (backoff * 2).min(DEFAULT_RETRY_MAX);
         }
     }
@@ -273,9 +317,10 @@ impl KimiClawChannel {
     async fn subscribe_once(
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SubscribeEnd> {
         let url = join_url(&self.api_host, SUBSCRIBE_PATH);
-        let body = encode_connect_envelope(&json!({}));
+        let since_id = self.last_event_id.read().await.clone();
+        let body = encode_connect_envelope(&build_subscribe_request(since_id.as_deref()));
         let resp = self
             .http_client()
             .post(&url)
@@ -290,12 +335,15 @@ impl KimiClawChannel {
         {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Kimi Claw auth failed ({status}): {text}");
+            anyhow::bail!("Kimi Claw auth failed ({status}): {}", truncate(&text, 200));
         }
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Subscribe failed status={status} body={text}");
+            anyhow::bail!(
+                "Subscribe failed status={status} body={}",
+                truncate(&text, 200)
+            );
         }
 
         if let Some(chat_id) = resp
@@ -315,6 +363,7 @@ impl KimiClawChannel {
                 ::serde_json::json!({
                     "host": self.api_host,
                     "alias": self.alias,
+                    "resumed": since_id.is_some(),
                     "has_user_id": self.user_id.is_some(),
                 })
             ),
@@ -323,41 +372,125 @@ impl KimiClawChannel {
 
         let mut stream = resp.bytes_stream();
         let mut buf = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|err| anyhow::anyhow!("Subscribe stream read failed: {err}"))?;
+        loop {
+            let chunk = match tokio::time::timeout(PING_TIMEOUT, stream.next()).await {
+                Err(_) => return Ok(SubscribeEnd::PingTimeout),
+                Ok(None) => return Ok(SubscribeEnd::Closed),
+                Ok(Some(chunk)) => {
+                    chunk.map_err(|err| anyhow::anyhow!("Subscribe stream read failed: {err}"))?
+                }
+            };
             buf.extend_from_slice(&chunk);
             while let Some(envelope) = pop_connect_envelope(&mut buf)? {
                 if envelope.end_stream {
                     if let Some(err) = connect_end_stream_error(&envelope.payload_text) {
                         anyhow::bail!("Subscribe stream failed: {err}");
                     }
-                    return Ok(());
+                    return Ok(SubscribeEnd::Closed);
                 }
-                if let Some(inbound) = parse_inbound_event(&envelope.payload) {
-                    if !self.is_user_allowed(&inbound.sender_id) {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Reject
-                            )
-                            .with_attrs(::serde_json::json!({
-                                "sender_id": inbound.sender_id,
-                                "reason": "not_in_peer_group",
-                            })),
-                            "kimi claw inbound skipped (allowlist)"
-                        );
-                        continue;
+                let event = &envelope.payload;
+                match classify_event(event) {
+                    EventKind::Ping => {
+                        self.saw_ping.store(true, Ordering::Relaxed);
                     }
-                    self.remember_chat_id(&inbound.chat_id).await;
-                    if tx.send(self.to_channel_message(inbound)).await.is_err() {
-                        anyhow::bail!("message channel closed");
+                    EventKind::Reconnect => return Ok(SubscribeEnd::ServerReconnect),
+                    EventKind::ChatMessage => {
+                        if let Some(meta) = parse_chat_event(event, self.user_id.as_deref()) {
+                            self.dispatch_chat_event(meta, tx).await?;
+                        }
                     }
+                    EventKind::Other => {}
+                }
+                if let Some(id) = first_string(event, &["id"]) {
+                    *self.last_event_id.write().await = Some(id);
                 }
             }
         }
+    }
+
+    async fn dispatch_chat_event(
+        &self,
+        meta: InboundMessage,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        if !self.is_user_allowed(&meta.sender_id) {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_attrs(::serde_json::json!({
+                        "sender_id": meta.sender_id,
+                        "reason": "not_in_peer_group",
+                    })),
+                "kimi claw inbound skipped (allowlist)"
+            );
+            return Ok(());
+        }
+        if !self.mark_seen(&meta.message_id) {
+            return Ok(());
+        }
+        let mut inbound = meta;
+        if inbound.text.is_empty() {
+            match self
+                .fetch_message_text(&inbound.chat_id, &inbound.message_id)
+                .await
+            {
+                Ok(text) if !text.is_empty() => inbound.text = text,
+                Ok(_) | Err(_) if inbound.summary.is_some() => {
+                    inbound.text = inbound.summary.clone().unwrap_or_default();
+                }
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "chat_id": inbound.chat_id,
+                                "message_id": inbound.message_id,
+                                "error": err.to_string(),
+                            })),
+                        "kimi claw listMessages failed; inbound dropped"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        self.remember_chat_id(&inbound.chat_id).await;
+        if tx.send(self.to_channel_message(inbound)).await.is_err() {
+            anyhow::bail!("message channel closed");
+        }
         Ok(())
+    }
+
+    /// Returns `true` the first time a message id is seen.
+    fn mark_seen(&self, message_id: &str) -> bool {
+        let mut seen = self
+            .seen_message_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.iter().any(|id| id == message_id) {
+            return false;
+        }
+        if seen.len() >= SEEN_CAPACITY {
+            seen.pop_front();
+        }
+        seen.push_back(message_id.to_string());
+        true
+    }
+
+    async fn fetch_message_text(&self, chat_id: &str, message_id: &str) -> anyhow::Result<String> {
+        let url = join_url(&self.api_host, LIST_MESSAGES_PATH);
+        let resp = self
+            .http_client()
+            .post(&url)
+            .headers(self.auth_headers(false))
+            .timeout(UNARY_TIMEOUT)
+            .json(&build_list_messages_request(chat_id, message_id))
+            .send()
+            .await?;
+        let resp = crate::util::ensure_success(resp, "kimi claw listMessages").await?;
+        let body: Value = resp.json().await?;
+        Ok(text_from_list_messages(&body, message_id))
     }
 
     fn to_channel_message(&self, inbound: InboundMessage) -> ChannelMessage {
@@ -387,6 +520,7 @@ impl KimiClawChannel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InboundMessage {
     message_id: String,
+    summary: Option<String>,
     chat_id: String,
     sender_id: String,
     sender_short_id: Option<String>,
@@ -402,6 +536,109 @@ struct ConnectEnvelope {
     payload: Value,
     payload_text: String,
     end_stream: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscribeEnd {
+    Closed,
+    PingTimeout,
+    ServerReconnect,
+}
+
+impl SubscribeEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::PingTimeout => "ping_timeout",
+            Self::ServerReconnect => "server_reconnect",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventKind {
+    Ping,
+    Reconnect,
+    ChatMessage,
+    Other,
+}
+
+fn classify_event(event: &Value) -> EventKind {
+    let case = event
+        .get("payload")
+        .and_then(|p| p.get("case"))
+        .and_then(Value::as_str);
+    let has = |camel: &str, snake: &str| {
+        event.get(camel).is_some() || event.get(snake).is_some() || case == Some(camel)
+    };
+    if has("chatMessage", "chat_message") {
+        EventKind::ChatMessage
+    } else if has("ping", "ping") {
+        EventKind::Ping
+    } else if has("reconnect", "reconnect") {
+        EventKind::Reconnect
+    } else {
+        EventKind::Other
+    }
+}
+
+/// `ChatMessageEvent.Status`: only `STATUS_COMPLETED` (2) is dispatched.
+fn is_completed(chat: &Value) -> bool {
+    match chat.get("status") {
+        Some(Value::String(s)) => s.eq_ignore_ascii_case("STATUS_COMPLETED"),
+        Some(Value::Number(n)) => n.as_i64() == Some(2),
+        _ => false,
+    }
+}
+
+fn build_subscribe_request(since_id: Option<&str>) -> Value {
+    match since_id {
+        Some(id) if !id.is_empty() => json!({ "sinceId": id }),
+        _ => json!({}),
+    }
+}
+
+fn build_list_messages_request(chat_id: &str, message_id: &str) -> Value {
+    json!({
+        "chatId": chat_id,
+        "startMessageId": message_id,
+        "endMessageId": message_id,
+        "includeStartMessage": true,
+        "includeEndMessage": true,
+        "direction": "DIRECTION_BACKWARD",
+        "pageSize": 20,
+        "pageToken": "",
+    })
+}
+
+fn text_from_list_messages(body: &Value, message_id: &str) -> String {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    messages
+        .iter()
+        .find(|m| {
+            m.get("message")
+                .and_then(|c| first_string(c, &["id"]))
+                .as_deref()
+                == Some(message_id)
+        })
+        .map(extract_message_text)
+        .unwrap_or_default()
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+fn with_jitter(base: Duration) -> Duration {
+    // Up to +20% jitter without pulling in an RNG for one call site.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or_default();
+    let extra = base.as_millis() as u64 * u64::from(nanos % 200) / 1000;
+    base + Duration::from_millis(extra)
 }
 
 pub(crate) fn normalize_base_url(url: &str) -> String {
@@ -505,21 +742,20 @@ fn regex_lite_replace(text: &str) -> String {
     out
 }
 
-fn parse_inbound_event(event: &Value) -> Option<InboundMessage> {
+fn parse_chat_event(event: &Value, self_id: Option<&str>) -> Option<InboundMessage> {
     let chat = event_chat_message(event)?;
-    if is_non_user_role(&chat) {
+    if !is_completed(chat) || is_non_user_role(chat) {
         return None;
     }
-    let message_id = first_string(&chat, &["messageId", "message_id"])?;
-    let chat_id = first_string(&chat, &["chatId", "chat_id"])?;
-    let sender_id = first_string(&chat, &["senderId", "sender_id"]).unwrap_or_default();
-    if sender_id.is_empty() {
+    let message_id = first_string(chat, &["messageId", "message_id"])?;
+    let chat_id = first_string(chat, &["chatId", "chat_id"])?;
+    let sender_id = first_string(chat, &["senderId", "sender_id"]).unwrap_or_default();
+    if sender_id.is_empty() || self_id.is_some_and(|me| me == sender_id) {
         return None;
     }
-    let text = extract_message_text(&chat);
-    if text.is_empty() {
-        return None;
-    }
+    // Real subscribe events carry no blocks; text is fetched later with
+    // ListMessages. Inline blocks are honored when present.
+    let text = extract_message_text(chat);
     let mentioned = chat
         .get("mentioned")
         .and_then(Value::as_bool)
@@ -529,12 +765,13 @@ fn parse_inbound_event(event: &Value) -> Option<InboundMessage> {
         .or_else(|| chat.get("room_type"))
         .cloned();
     let is_group =
-        is_group_room(&room_type) || first_string(&chat, &["roomId", "room_id"]).is_some();
-    let timestamp_secs = extract_timestamp_secs(&chat).unwrap_or_else(now_secs);
+        is_group_room(&room_type) || first_string(chat, &["roomId", "room_id"]).is_some();
+    let timestamp_secs = extract_timestamp_secs(chat).unwrap_or_else(now_secs);
     Some(InboundMessage {
         message_id,
+        summary: first_string(chat, &["summary"]).map(|s| strip_im_textual_mentions(&s)),
         chat_id,
-        sender_short_id: first_string(&chat, &["senderShortId", "sender_short_id"]),
+        sender_short_id: first_string(chat, &["senderShortId", "sender_short_id"]),
         sender_id,
         text,
         mentioned,
@@ -559,9 +796,9 @@ fn event_chat_message(event: &Value) -> Option<&Value> {
 }
 
 fn is_non_user_role(chat: &Value) -> bool {
-    let message = chat.get("message").unwrap_or(chat);
-    let role = message
+    let role = chat
         .get("role")
+        .or_else(|| chat.get("message").and_then(|m| m.get("role")))
         .and_then(|v| {
             v.as_str()
                 .map(ToOwned::to_owned)
@@ -569,7 +806,11 @@ fn is_non_user_role(chat: &Value) -> bool {
         })
         .unwrap_or_default()
         .to_ascii_lowercase();
-    matches!(role.as_str(), "assistant" | "bot" | "system" | "2" | "3")
+    // kimi.chat.v1.Role: ROLE_UNSPECIFIED=0, system=1, user=2, assistant=3.
+    matches!(
+        role.as_str(),
+        "assistant" | "bot" | "system" | "role_assistant" | "role_system" | "1" | "3"
+    )
 }
 
 fn extract_message_text(chat: &Value) -> String {
@@ -725,6 +966,7 @@ mod tests {
             "chatMessage": {
                 "chatId": "chat-42",
                 "messageId": "msg-9",
+                "status": "STATUS_COMPLETED",
                 "senderId": "user-1",
                 "senderShortId": "ada",
                 "mentioned": true,
@@ -738,7 +980,7 @@ mod tests {
                 }
             }
         });
-        let inbound = parse_inbound_event(&event).unwrap();
+        let inbound = parse_chat_event(&event, None).unwrap();
         assert_eq!(inbound.chat_id, "chat-42");
         assert_eq!(inbound.message_id, "msg-9");
         assert_eq!(inbound.sender_id, "user-1");
@@ -756,6 +998,7 @@ mod tests {
                 "value": {
                     "chatId": "c1",
                     "messageId": "m1",
+                    "status": 2,
                     "senderId": "u1",
                     "message": {
                         "role": "user",
@@ -766,7 +1009,7 @@ mod tests {
                 }
             }
         });
-        let inbound = parse_inbound_event(&event).unwrap();
+        let inbound = parse_chat_event(&event, None).unwrap();
         assert_eq!(inbound.text, "hi");
         assert!(!inbound.is_group);
     }
@@ -777,13 +1020,14 @@ mod tests {
             "chatMessage": {
                 "chatId": "c1",
                 "messageId": "m1",
+                "status": "STATUS_COMPLETED",
                 "senderId": "bot",
                 "message": {"role": "assistant", "blocks": [{"text": {"content": "hi"}}]}
             }
         });
-        assert!(parse_inbound_event(&assistant).is_none());
+        assert!(parse_chat_event(&assistant, None).is_none());
         let ping = json!({"ping": {}});
-        assert!(parse_inbound_event(&ping).is_none());
+        assert!(parse_chat_event(&ping, None).is_none());
     }
 
     #[test]
@@ -801,6 +1045,7 @@ mod tests {
         let channel = KimiClawChannel::new("test-token".into(), "default", Arc::new(Vec::new));
         let msg = channel.to_channel_message(InboundMessage {
             message_id: "m1".into(),
+            summary: None,
             chat_id: "c1".into(),
             sender_id: "u1".into(),
             sender_short_id: Some("ada".into()),
@@ -819,5 +1064,111 @@ mod tests {
             ChannelConversationScope::ReplyTarget
         );
         assert!(!msg.content.contains("token"));
+    }
+
+    #[test]
+    fn real_event_shape_without_blocks_needs_fetch() {
+        // Matches kimi.gateway.im.v1.ChatMessageEvent: metadata only.
+        let event = json!({
+            "id": "evt-7",
+            "chatMessage": {
+                "chatId": "c1",
+                "messageId": "m1",
+                "status": "STATUS_COMPLETED",
+                "senderId": "u1",
+                "role": "user",
+                "summary": "hola que tal"
+            }
+        });
+        assert_eq!(classify_event(&event), EventKind::ChatMessage);
+        let inbound = parse_chat_event(&event, None).unwrap();
+        assert!(inbound.text.is_empty());
+        assert_eq!(inbound.summary.as_deref(), Some("hola que tal"));
+    }
+
+    #[test]
+    fn generating_and_unspecified_events_are_not_dispatched() {
+        for status in [json!("STATUS_GENERATING"), json!(1), json!(null)] {
+            let event = json!({"chatMessage": {
+                "chatId": "c1", "messageId": "m1", "senderId": "u1", "status": status
+            }});
+            assert!(parse_chat_event(&event, None).is_none());
+        }
+    }
+
+    #[test]
+    fn numeric_user_role_is_accepted_and_self_is_skipped() {
+        let event = json!({"chatMessage": {
+            "chatId": "c1", "messageId": "m1", "senderId": "u1",
+            "status": 2, "role": 2
+        }});
+        assert!(parse_chat_event(&event, None).is_some());
+        assert!(parse_chat_event(&event, Some("u1")).is_none());
+        let assistant = json!({"chatMessage": {
+            "chatId": "c1", "messageId": "m1", "senderId": "b1",
+            "status": 2, "role": 3
+        }});
+        assert!(parse_chat_event(&assistant, None).is_none());
+    }
+
+    #[test]
+    fn classifies_ping_and_reconnect() {
+        assert_eq!(
+            classify_event(&json!({"id": "1", "ping": {}})),
+            EventKind::Ping
+        );
+        assert_eq!(
+            classify_event(&json!({"reconnect": {}})),
+            EventKind::Reconnect
+        );
+        assert_eq!(
+            classify_event(&json!({"payload": {"case": "reconnect", "value": {}}})),
+            EventKind::Reconnect
+        );
+        assert_eq!(classify_event(&json!({"botReport": {}})), EventKind::Other);
+    }
+
+    #[test]
+    fn subscribe_request_resumes_with_since_id() {
+        assert_eq!(build_subscribe_request(None), json!({}));
+        assert_eq!(
+            build_subscribe_request(Some("evt-9")),
+            json!({"sinceId": "evt-9"})
+        );
+    }
+
+    #[test]
+    fn list_messages_request_and_response() {
+        let req = build_list_messages_request("c1", "m1");
+        assert_eq!(req["startMessageId"], "m1");
+        assert_eq!(req["endMessageId"], "m1");
+        assert_eq!(req["direction"], "DIRECTION_BACKWARD");
+        let body = json!({"messages": [
+            {"message": {"id": "m0", "blocks": [{"text": {"content": "old"}}]}, "senderId": "u1"},
+            {"message": {"id": "m1", "role": "user", "blocks": [
+                {"id": "b1", "text": {"content": "<@bot|Zero> hola"}},
+                {"id": "b2", "text": {"content": "segunda linea"}}
+            ]}, "senderId": "u1"}
+        ]});
+        assert_eq!(text_from_list_messages(&body, "m1"), "hola\nsegunda linea");
+        assert_eq!(text_from_list_messages(&body, "missing"), "");
+    }
+
+    #[test]
+    fn duplicate_message_ids_are_dropped() {
+        let channel = KimiClawChannel::new("t".into(), "default", Arc::new(Vec::new));
+        assert!(channel.mark_seen("m1"));
+        assert!(!channel.mark_seen("m1"));
+        for i in 0..SEEN_CAPACITY {
+            channel.mark_seen(&format!("x{i}"));
+        }
+        assert!(channel.mark_seen("m1"));
+    }
+
+    #[test]
+    fn jitter_stays_within_twenty_percent() {
+        let base = Duration::from_secs(10);
+        let j = with_jitter(base);
+        assert!(j >= base && j <= base + Duration::from_secs(2));
     }
 }
