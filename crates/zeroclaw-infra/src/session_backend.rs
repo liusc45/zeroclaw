@@ -279,6 +279,20 @@ pub trait SessionBackend: Send + Sync {
         Ok(())
     }
 
+    /// Rolling summary of earlier session messages, separate from transcript rows.
+    /// Backends without summary persistence may retain the default no-op behavior.
+    fn set_session_summary(
+        &self,
+        _session_key: &str,
+        _summary: Option<&str>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn get_session_summary(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Get the recorded breadcrumb provenance for a session. `None` means
     /// the backend doesn't track it or no session-level state exists yet
     /// (callers should assume `false`, not attempt text inference).

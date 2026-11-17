@@ -181,3 +181,73 @@ Tool-result length limits are separate. `max_tool_result_chars` bounds an
 individual result when it is recorded; it does not trim conversation history.
 Provider-side context enforcement is also separate, though a provider overflow
 can trigger the runtime's reactive token-budget trim.
+
+## Rolling channel summaries
+
+Channel histories can retain a rolling summary of messages removed by the
+message cap or token-budget recovery. This is opt-in and requires both an
+enabled runtime profile and a configured summary provider:
+
+```toml
+[agents.example]
+# Other required agent settings omitted.
+runtime_profile = "example"
+summary_provider = "custom.summary"
+
+[runtime_profiles.example]
+max_history_messages = 50
+
+[runtime_profiles.example.context_compression]
+enabled = true
+summary_max_chars = 4000
+source_max_chars = 50000
+timeout_secs = 60
+# Alternatively set summary_provider here; the agent override wins.
+
+[memory]
+consolidation_provider = "custom.summary"
+```
+
+`custom.summary` must reference an existing `[providers.models.custom.summary]`
+entry with a model. There is no implicit main-model fallback for rolling
+summaries. Empty or unresolved references leave ordinary trimming in place.
+Zero limits use the defaults shown above. Legacy compression controls such as
+`threshold_ratio`, `protect_first_n`, `protect_last_n`, `max_passes`,
+`identifier_policy` and tool-result retrimming remain unsupported and still warn.
+
+The channel owner buffers dropped rows until a background summary attempt. One
+worker per session merges them with the previous summary using that provider's
+model and temperature. Requests are bounded in characters, tool output uses
+short extracts, and the attempt (including provider setup) has a timeout. Errors,
+timeouts and empty output log a warning and leave the reply using trimmed
+history. The reply never waits for the summary provider; the new summary is
+available to subsequent requests after publication. With this feature enabled,
+message-cap trimming persists the retained window to avoid replaying already
+summarized rows after restart. It retains complete exchanges and the newest exchange can
+exceed the cap when necessary to preserve tool pairing.
+
+The summary is a preamble at the beginning of the existing system message,
+separate from transcript rows and the trim breadcrumb. It consumes no user turn
+and is never fed back as a dropped conversation row. JSONL stores persist it in
+an atomic `<sanitized-session-key>.summary` sidecar; SQLite stores it in the
+`session_metadata.rolling_summary` column. Hydration loads it on restart. Session
+reset/delete clears it, and reset fences any old in-flight summary worker.
+Pending buffers are process-local: stopping the daemon before an attempt
+finishes can lose that pending batch. JSONL-to-SQLite migration imports the
+summary in the same transaction as its transcript and breadcrumb.
+
+`memory.consolidation_provider` independently selects the provider, model and
+temperature for channel memory consolidation. Empty uses the main model, even
+when rolling summaries are enabled. Initialization failure also falls back to
+the main model. Enabling either option sends conversation content to the selected
+provider and adds model calls; the existing memory/session scope still applies.
+Disable `context_compression.enabled` and clear `memory.consolidation_provider`
+to restore upstream routing and plain trimming. Persisted summaries remain
+stored but are not injected while compression is disabled.
+
+Structured `Agent` and standalone legacy CLI histories retain their existing
+trimming behavior in this implementation. They use different history,
+composition and persistence owners; adding background session workers there
+would require a separate lifecycle integration. `Agent` autosave currently
+calls `Memory::store` directly rather than a consolidation LLM, so it has no
+consolidation provider call to reroute.

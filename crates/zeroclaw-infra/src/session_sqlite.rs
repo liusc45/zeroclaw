@@ -188,6 +188,10 @@ impl SqliteSessionBackend {
         for (column, ddl) in [
             ("name", "ALTER TABLE session_metadata ADD COLUMN name TEXT"),
             (
+                "rolling_summary",
+                "ALTER TABLE session_metadata ADD COLUMN rolling_summary TEXT",
+            ),
+            (
                 "state",
                 "ALTER TABLE session_metadata ADD COLUMN state TEXT NOT NULL DEFAULT 'idle'",
             ),
@@ -838,11 +842,20 @@ impl SqliteSessionBackend {
                             )));
                         }
                     };
+                let rolling_summary =
+                    match std::fs::read_to_string(sessions_dir.join(format!("{key}.summary"))) {
+                        Ok(summary) => Some(summary),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(anyhow::Error::new(e)
+                                .context("Failed to read JSONL rolling summary"));
+                        }
+                    };
                 tx.execute(
                     "INSERT INTO session_metadata \
-                     (session_key, created_at, last_activity, message_count, trim_breadcrumb) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![key, now, now, inserted, trim_breadcrumb.map(i64::from)],
+                     (session_key, created_at, last_activity, message_count, trim_breadcrumb, rolling_summary) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![key, now, now, inserted, trim_breadcrumb.map(i64::from), rolling_summary],
                 )
                 .with_context(|| format!("Failed to record metadata for JSONL session {name}"))?;
                 tx.execute(
@@ -1318,7 +1331,7 @@ impl SessionBackend for SqliteSessionBackend {
         // and a stale recorded `true` on an already-empty session must not
         // survive to misclassify the next first message.
         conn.execute(
-            "UPDATE session_metadata SET message_count = 0, last_activity = ?1, trim_breadcrumb = NULL WHERE session_key = ?2",
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1, trim_breadcrumb = NULL, rolling_summary = NULL WHERE session_key = ?2",
             params![Utc::now().to_rfc3339(), session_key],
         )
         .map_err(std::io::Error::other)?;
@@ -1853,6 +1866,38 @@ impl SessionBackend for SqliteSessionBackend {
         })
     }
 
+    fn set_session_summary(&self, session_key: &str, summary: Option<&str>) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        if summary.is_none() {
+            return conn
+                .execute(
+                    "UPDATE session_metadata SET rolling_summary = NULL WHERE session_key = ?1",
+                    params![session_key],
+                )
+                .map(|_| ())
+                .map_err(std::io::Error::other);
+        }
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, rolling_summary)
+             VALUES (?1, ?2, ?2, 0, ?3)
+             ON CONFLICT(session_key) DO UPDATE SET rolling_summary = excluded.rolling_summary",
+            params![session_key, now, summary],
+        ).map(|_| ()).map_err(std::io::Error::other)
+    }
+
+    fn get_session_summary(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT rolling_summary FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(std::io::Error::other)
+    }
+
     fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
         let conn = self.conn.lock();
         Self::set_session_trim_breadcrumb_on(&conn, session_key, present)
@@ -1903,6 +1948,48 @@ impl SessionBackend for SqliteSessionBackend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rolling_summary_migrates_with_jsonl_transcript() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let jsonl = SessionStore::new(tmp.path()).unwrap();
+        jsonl
+            .append("chat", &ChatMessage::user("question"))
+            .unwrap();
+        jsonl
+            .set_session_summary("chat", Some("- Earlier decision: 42 EUR"))
+            .unwrap();
+        let sqlite = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(sqlite.migrate_from_jsonl(tmp.path()).unwrap(), 1);
+        assert_eq!(
+            sqlite.get_session_summary("chat").unwrap().as_deref(),
+            Some("- Earlier decision: 42 EUR")
+        );
+        assert_eq!(sqlite.load("chat").len(), 1);
+    }
+
+    #[test]
+    fn rolling_summary_round_trip_and_reset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(store.get_session_summary("chat").unwrap(), None);
+        store
+            .set_session_summary("chat", Some("- Fecha: 2030-02-03; €42"))
+            .unwrap();
+        drop(store);
+        let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(
+            store.get_session_summary("chat").unwrap().as_deref(),
+            Some("- Fecha: 2030-02-03; €42")
+        );
+        store.clear_messages("chat").unwrap();
+        assert_eq!(store.get_session_summary("chat").unwrap(), None);
+        store
+            .set_session_summary("chat", Some("summary only"))
+            .unwrap();
+        store.delete_session("chat").unwrap();
+        assert_eq!(store.get_session_summary("chat").unwrap(), None);
+    }
+
     #[test]
     fn guarded_state_and_delete_recheck_owner_and_authority_after_connection_wait() {
         use std::sync::{

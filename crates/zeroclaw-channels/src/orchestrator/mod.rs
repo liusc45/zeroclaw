@@ -7,6 +7,7 @@ pub mod acp_server;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
+mod rolling_summary;
 
 // Channel types imported directly from source crates (no shim files)
 #[cfg(feature = "channel-amqp")]
@@ -705,6 +706,8 @@ struct ChannelRuntimeContext {
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
     history_crumb_flags: HistoryCrumbMap,
+    /// Owns rolling summaries and pending dropped rows; reset invalidates in-flight workers.
+    rolling_summaries: rolling_summary::SummarySessions,
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
@@ -3544,6 +3547,7 @@ pub(crate) fn voice_override_from_sender_verdict(verdict: Option<bool>) -> (Opti
 }
 
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
+    rolling_summary::clear(ctx, sender_key);
     ctx.conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -3923,6 +3927,8 @@ fn effective_non_cli_tool_names<'a>(
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut histories = ctx
         .conversation_histories
         .lock()
@@ -3936,9 +3942,21 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
         return false;
     }
 
-    let keep_from = turns
-        .len()
-        .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+    if rolling_summary::enabled(ctx) {
+        rolling_summary::trim_cached(
+            ctx,
+            sender_key,
+            turns,
+            CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES,
+        );
+    }
+    let keep_from = if rolling_summary::enabled(ctx) {
+        0
+    } else {
+        turns
+            .len()
+            .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES)
+    };
     let mut compacted = normalize_cached_channel_turns(turns[keep_from..].to_vec());
 
     for turn in &mut compacted {
@@ -3984,6 +4002,7 @@ fn hydrate_sender_history_if_missing(ctx: &ChannelRuntimeContext, sender_key: &s
         if missing && let Some(ref store) = ctx.session_store {
             match hydrate_session_transcript(store.as_ref(), sender_key) {
                 Ok(Some(hydrated)) => {
+                    rolling_summary::hydrate(ctx, sender_key, hydrated.dropped_messages);
                     ctx.history_crumb_flags
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -4141,9 +4160,7 @@ fn append_sender_turn(
         .unwrap_or_else(|e| e.into_inner());
     let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
     turns.push(turn);
-    while turns.len() > max_history {
-        turns.remove(0);
-    }
+    rolling_summary::trim_cached(ctx, sender_key, turns, max_history);
     Some(turns.clone())
 }
 
@@ -4208,9 +4225,7 @@ fn append_bound_exchange(
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
         turns.extend(messages[..kept].iter().cloned());
-        while turns.len() > max_history {
-            turns.remove(0);
-        }
+        rolling_summary::trim_cached(ctx, sender_key, turns, max_history);
     }
 
     match failure {
@@ -4505,6 +4520,29 @@ fn resync_sender_history_after_trim(
         }
     }
 
+    {
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(before) = histories.peek(sender_key) {
+            let crumb_before = ctx
+                .history_crumb_flags
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(sender_key)
+                .copied()
+                .unwrap_or(crumb_present_before_loop);
+            rolling_summary::queue_trimmed_prefix(
+                ctx,
+                sender_key,
+                before,
+                &published_turns,
+                crumb_before,
+                breadcrumb_present,
+            );
+        }
+    }
     let mut histories = ctx
         .conversation_histories
         .lock()
@@ -5913,7 +5951,7 @@ fn parse_reply_intent(response: &str) -> AssistantChannelOutcome {
     AssistantChannelOutcome::Reply(String::new())
 }
 
-async fn resolve_classifier_route(
+async fn resolve_secondary_route(
     ctx: &ChannelRuntimeContext,
     provider_ref: &zeroclaw_config::providers::ModelProviderRef,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
@@ -5931,7 +5969,7 @@ async fn resolve_classifier_route(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"provider": provider_str})),
-                "classifier_provider must be dotted `<type>.<alias>`; falling back to main agent"
+                "Secondary provider must be dotted `<type>.<alias>`; override unavailable"
             );
             return None;
         }
@@ -5950,7 +5988,7 @@ async fn resolve_classifier_route(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"provider": provider_str})),
-                "classifier_provider references an unknown [providers.models.<type>.<alias>] entry; falling back to main agent"
+                "Secondary provider references an unknown [providers.models.<type>.<alias>] entry; override unavailable"
             );
             return None;
         }
@@ -5964,7 +6002,7 @@ async fn resolve_classifier_route(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({"provider": provider_str})),
-            "classifier_provider points to a [providers.models] entry without a `model` field; falling back to main agent"
+            "Secondary provider points to a [providers.models] entry without a `model` field; override unavailable"
         );
         return None;
     }
@@ -5985,7 +6023,7 @@ async fn resolve_classifier_route(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"provider": provider_str, "error": safe_err})),
-                "Failed to initialize classifier_provider; falling back to main agent provider"
+                "Failed to initialize secondary provider; override unavailable"
             );
             return None;
         }
@@ -5995,7 +6033,7 @@ async fn resolve_classifier_route(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_attrs(::serde_json::json!({"provider": provider_str, "model": model.as_str()})),
-        "classifier_provider override active"
+        "Secondary provider override active"
     );
 
     Some((provider, model, temperature))
@@ -9826,6 +9864,7 @@ async fn process_channel_message_body(
     // Captured before the tool-call loop can drop whole turns, so the
     // post-loop resync below can detect that a trim happened.
     let prior_turns_len_before_loop = prior_turns.len();
+    let system_prompt = rolling_summary::with_preamble(ctx.as_ref(), &history_key, system_prompt);
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     // Breadcrumb provenance is carried alongside the transcript so a synthetic
@@ -9920,7 +9959,7 @@ async fn process_channel_message_body(
                     );
                 }
                 let configured_classifier = if configured_classifier_allowed {
-                    resolve_classifier_route(
+                    resolve_secondary_route(
                         ctx.as_ref(),
                         &ctx.agent_cfg.classifier_provider,
                         &runtime_defaults,
@@ -10959,11 +10998,18 @@ async fn process_channel_message_body(
                 let model_provider = Arc::clone(&ctx.model_provider);
                 let model = ctx.model.to_string();
                 let temperature = ctx.temperature;
+                let consolidation_ctx = Arc::clone(&ctx);
                 let user_msg = msg.content.clone();
                 let assistant_resp = history_response.clone();
                 let autosave_lease = turn_lease.clone();
                 zeroclaw_spawn::spawn!(async move {
                     let _lease = autosave_lease;
+                    let (model_provider, model, temperature) =
+                        rolling_summary::consolidation_route(
+                            consolidation_ctx.as_ref(),
+                            (model_provider, model, temperature),
+                        )
+                        .await;
                     if let Err(e) = memory_strategy
                         .consolidate_turn(
                             &user_msg,
@@ -16753,6 +16799,8 @@ fn compose_channel_mcp_prompt_sections(
 /// Result of hydrating one session's transcript at startup.
 struct HydratedSession {
     messages: Vec<ChatMessage>,
+    /// Rows removed by the hydration cap, excluding the owned breadcrumb.
+    dropped_messages: Vec<ChatMessage>,
     crumb_present: bool,
     orphan_closed: bool,
 }
@@ -16844,8 +16892,13 @@ fn hydrate_session_transcript(
             && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
     });
     let truncated = msgs.len() > MAX_CHANNEL_HISTORY;
-    if truncated {
-        msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
+    let mut dropped_messages: Vec<_> = if truncated {
+        msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY).collect()
+    } else {
+        Vec::new()
+    };
+    if durable_crumb.unwrap_or(marker_present_pre_drain) && !dropped_messages.is_empty() {
+        dropped_messages.remove(0);
     }
 
     let mut orphan_closed = false;
@@ -16924,6 +16977,7 @@ fn hydrate_session_transcript(
 
     Ok(Some(HydratedSession {
         messages: msgs,
+        dropped_messages,
         crumb_present,
         orphan_closed,
     }))
@@ -17697,6 +17751,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: sop_engine.clone(),
             sop_audit: sop_audit.clone(),
             security: Arc::clone(&security),
@@ -17756,6 +17811,9 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             else {
                 continue;
             };
+            let persist_lock = acquire_persist_lock(target_ctx, &m.key);
+            let _guard = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+            rolling_summary::hydrate(target_ctx, &m.key, hydrated_session.dropped_messages);
             let mut msgs = hydrated_session.messages;
             if hydrated_session.orphan_closed {
                 orphans_closed += 1;
@@ -18380,6 +18438,7 @@ fn concurrent_persist_lock_serialization() {
         last_applied_config_stamp: Arc::new(Mutex::new(None)),
         runtime_defaults_override: Arc::new(Mutex::new(None)),
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
+        rolling_summaries: Default::default(),
         sop_engine: None,
         sop_audit: None,
         security: Arc::new(SecurityPolicy::default()),
@@ -18565,6 +18624,7 @@ fn test_channel_ctx_with_backend(
         last_applied_config_stamp: Arc::new(Mutex::new(None)),
         runtime_defaults_override: Arc::new(Mutex::new(None)),
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
+        rolling_summaries: Default::default(),
         sop_engine: None,
         sop_audit: None,
         sop_driver_sink: None,
@@ -18686,6 +18746,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         last_applied_config_stamp: Arc::new(Mutex::new(None)),
         runtime_defaults_override: Arc::new(Mutex::new(None)),
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
+        rolling_summaries: Default::default(),
         sop_engine: None,
         sop_audit: None,
         sop_driver_sink: None,
@@ -22917,6 +22978,7 @@ temperature = 0.3
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -23358,7 +23420,7 @@ temperature = 0.3
     async fn resolve_classifier_route_returns_none_for_empty_ref() {
         let ctx = router_test_ctx();
         let empty = zeroclaw_config::providers::ModelProviderRef::default();
-        let result = resolve_classifier_route(
+        let result = resolve_secondary_route(
             ctx.as_ref(),
             &empty,
             &runtime_defaults_snapshot(ctx.as_ref()),
@@ -23371,7 +23433,7 @@ temperature = 0.3
     async fn resolve_classifier_route_returns_none_for_unresolvable_ref() {
         let ctx = router_test_ctx();
         let bogus = zeroclaw_config::providers::ModelProviderRef::from("custom.does-not-exist");
-        let result = resolve_classifier_route(
+        let result = resolve_secondary_route(
             ctx.as_ref(),
             &bogus,
             &runtime_defaults_snapshot(ctx.as_ref()),
@@ -23405,7 +23467,7 @@ temperature = 0.3
         });
 
         let alias_ref = zeroclaw_config::providers::ModelProviderRef::from("openai.my-classifier");
-        let result = resolve_classifier_route(
+        let result = resolve_secondary_route(
             ctx.as_ref(),
             &alias_ref,
             &runtime_defaults_snapshot(ctx.as_ref()),
@@ -23897,6 +23959,7 @@ temperature = 0.3
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -24381,6 +24444,7 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -24490,6 +24554,7 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -24617,6 +24682,7 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -24748,6 +24814,7 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -26774,6 +26841,7 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -26883,6 +26951,7 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -30147,6 +30216,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -30331,6 +30401,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -30511,6 +30582,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             sop_driver_sink: None,
@@ -30717,6 +30789,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             sop_driver_sink: None,
@@ -30909,6 +30982,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             sop_driver_sink: None,
@@ -31110,6 +31184,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             sop_driver_sink: None,
@@ -31685,6 +31760,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             sop_driver_sink: None,
@@ -31838,6 +31914,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             sop_driver_sink: None,
@@ -31970,6 +32047,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             sop_driver_sink: None,
@@ -32282,6 +32360,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             sop_driver_sink: None,
@@ -32413,6 +32492,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             sop_driver_sink: None,
@@ -32569,6 +32649,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -32711,6 +32792,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -32838,6 +32920,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -32980,6 +33063,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -33150,6 +33234,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -33358,6 +33443,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -33878,6 +33964,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -34003,6 +34090,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -34135,6 +34223,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -35622,6 +35711,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -35832,6 +35922,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -36003,6 +36094,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -36173,6 +36265,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -36338,6 +36431,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -36548,6 +36642,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -36790,6 +36885,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -36936,6 +37032,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -37619,6 +37716,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -37758,6 +37856,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -37901,6 +38000,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -38036,6 +38136,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -38171,6 +38272,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -38593,6 +38695,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -40125,6 +40228,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -46829,6 +46933,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -47017,6 +47122,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -47593,6 +47699,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -48094,6 +48201,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -48269,6 +48377,7 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -52316,6 +52425,7 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy {
@@ -52453,6 +52563,7 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy {
@@ -52627,6 +52738,7 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             sop_driver_sink: None,
@@ -52949,6 +53061,7 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -53114,6 +53227,7 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -53271,6 +53385,7 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -53448,6 +53563,7 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
@@ -54628,6 +54744,7 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rolling_summaries: Default::default(),
             sop_engine: None,
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),

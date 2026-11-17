@@ -4350,8 +4350,8 @@ pub struct AliasedAgentConfig {
 
     /// Per-agent override for the context-compression summarizer provider, as
     /// a `providers.models.<type>.<alias>` reference. Empty (Default) = inherit
-    /// the runtime profile's `context_compression.summary_provider`, else the
-    /// agent's own resolved provider+model. Reference only, never a copy;
+    /// the runtime profile's `context_compression.summary_provider`. If both
+    /// references are empty, rolling summaries remain disabled. Reference only, never a copy;
     /// resolved by [`Config::effective_summary_provider`]. Validated in
     /// `Config::validate()`.
     #[tab(Providers)]
@@ -4655,8 +4655,8 @@ impl Config {
 
     /// Effective context-compression summarizer provider for an agent:
     /// agent-level `summary_provider` override → the runtime profile's
-    /// `context_compression.summary_provider` → `None` (the caller then reuses
-    /// the agent's own provider and model). Unlike the inert agent-inline
+    /// `context_compression.summary_provider` → `None` (rolling summaries stay disabled).
+    /// Unlike the inert agent-inline
     /// tunables below, the agent-level override IS consulted — it's an
     /// explicit per-agent choice, mirroring `classifier_provider`'s
     /// "empty = inherit" semantics.
@@ -12923,6 +12923,10 @@ pub struct MemoryConfig {
     /// backend globally and on every agent (validated at config load).
     #[serde(default)]
     pub consolidation_extract_facts: bool,
+    /// Optional consolidation model provider (`<type>.<alias>` in providers.models).
+    /// Empty uses the main agent provider, model and temperature. Independent of context compression.
+    #[serde(default)]
+    pub consolidation_provider: crate::providers::ModelProviderRef,
     /// Move daily/session files to the archive directory after this many days. Keeps the hot working set small without deleting history.
     #[serde(default = "default_archive_after_days")]
     pub archive_after_days: u32,
@@ -13555,6 +13559,7 @@ impl Default for MemoryConfig {
             auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
             consolidation_extract_facts: false,
+            consolidation_provider: crate::providers::ModelProviderRef::default(),
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),
@@ -24252,25 +24257,7 @@ impl Config {
         }
     }
 
-    /// Surface every non-default `context_compression` knob as inert: the
-    /// runtime context compressor was removed and nothing in the
-    /// workspace reads `context_compression` at runtime anymore, so the whole
-    /// struct — `enabled`, thresholds, protected counts, summarizer limits,
-    /// provider selection, tool-result retrimming — has no effect. Mirrors
-    /// `validate_memory_semantics`: one warning per non-default field, so a
-    /// user sees exactly which of their authored knobs are dead. A field
-    /// explicitly written at its default value is indistinguishable from an
-    /// omitted one post-deserialization and stays silent (same limitation as
-    /// `validate_memory_semantics`).
-    ///
-    /// Only `[runtime_profiles.<alias>.context_compression]` is checked —
-    /// `AliasedAgentConfig` (`[agents.<alias>]`) has no `context_compression`
-    /// field of its own, and the legacy pre-V3 `[agent.context_compression]`
-    /// top-level table (folded into `[runtime_profiles.default]` by the V2→V3
-    /// migration, see `schema/v2.rs`) has already collapsed into this same
-    /// surface by the time `Config` exists, so a single pass over
-    /// `runtime_profiles` covers both the historical and current authored
-    /// forms without double-warning.
+    /// Warn about legacy compression controls unused by rolling history summaries.
     fn collect_context_compression_ignored_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
@@ -24279,21 +24266,6 @@ impl Config {
         for (alias, profile) in &self.runtime_profiles {
             let cc = &profile.context_compression;
 
-            // `enabled = true` gets its own message: it is the master switch
-            // users flip expecting compression to happen at all.
-            if cc.enabled {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "context_compression_unsupported",
-                    format!(
-                        "runtime_profiles.{alias}.context_compression.enabled is set but context \
-                         compression is not currently implemented in the runtime (the compressor \
-                         was removed in #8196); this setting has no effect."
-                    ),
-                    format!("runtime_profiles.{alias}.context_compression.enabled"),
-                ));
-            }
-
-            // Every other knob: flag any value that differs from the default.
             let mut inert: Vec<&'static str> = Vec::new();
             if (cc.threshold_ratio - defaults.threshold_ratio).abs() > f64::EPSILON {
                 inert.push("threshold_ratio");
@@ -24306,18 +24278,6 @@ impl Config {
             }
             if cc.max_passes != defaults.max_passes {
                 inert.push("max_passes");
-            }
-            if cc.summary_max_chars != defaults.summary_max_chars {
-                inert.push("summary_max_chars");
-            }
-            if cc.source_max_chars != defaults.source_max_chars {
-                inert.push("source_max_chars");
-            }
-            if cc.timeout_secs != defaults.timeout_secs {
-                inert.push("timeout_secs");
-            }
-            if cc.summary_provider != defaults.summary_provider {
-                inert.push("summary_provider");
             }
             if cc.identifier_policy != defaults.identifier_policy {
                 inert.push("identifier_policy");
@@ -24334,9 +24294,8 @@ impl Config {
                     "context_compression_unsupported",
                     format!(
                         "runtime_profiles.{alias}.context_compression.{field} is set to a \
-                         non-default value but context compression is not currently implemented \
-                         in the runtime (the compressor was removed in #8196); this setting has \
-                         no effect."
+                         non-default value but this legacy compression control is not implemented; \
+                         rolling history summaries do not use this setting."
                     ),
                     format!("runtime_profiles.{alias}.context_compression.{field}"),
                 ));
@@ -25980,6 +25939,26 @@ impl Config {
                 "delegate.agentic_timeout_secs",
                 "delegate.agentic_timeout_secs must be greater than 0"
             );
+        }
+
+        let value = self.memory.consolidation_provider.trim();
+        if !value.is_empty() {
+            match value.split_once('.') {
+                Some((ty, alias)) if !ty.is_empty() && !alias.is_empty() => {
+                    if self.providers.models.find(ty, alias).is_none() {
+                        validation_bail!(
+                            DanglingReference,
+                            "memory.consolidation_provider",
+                            "memory.consolidation_provider = {value:?} but providers.models.{ty}.{alias} is not configured"
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    "memory.consolidation_provider",
+                    "memory.consolidation_provider must be dotted form `<type>.<alias>` (got {value:?})"
+                ),
+            }
         }
 
         // Per-profile validation: the context-compression summarizer provider
@@ -52716,6 +52695,74 @@ allowed_users = []
         );
     }
 
+    #[tokio::test]
+    async fn consolidation_provider_validation_and_config_properties() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [memory]
+            consolidation_provider = "custom.summary"
+            [providers.models.custom.summary]
+            model = "summary-model"
+            uri = "https://example.invalid/v1"
+            wire_api = "chat_completions"
+            [risk_profiles.default]
+            level = "supervised"
+            [agents.default]
+            model_provider = "custom.summary"
+            risk_profile = "default"
+        "#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.get_prop("memory.consolidation_provider").unwrap(),
+            "custom.summary"
+        );
+        assert!(
+            cfg.prop_fields()
+                .iter()
+                .any(|field| field.name == "memory.consolidation_provider")
+        );
+        let roundtrip: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.memory.consolidation_provider.as_str(),
+            "custom.summary"
+        );
+        for invalid in ["bare", "custom.absent", "custom.", ".summary"] {
+            cfg.memory.consolidation_provider = invalid.into();
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("memory.consolidation_provider"), "{error}");
+        }
+        cfg.memory.consolidation_provider = Default::default();
+        cfg.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rolling_summary_honored_controls_do_not_warn() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [runtime_profiles.test.context_compression]
+            enabled = true
+            summary_provider = "custom.summary"
+            summary_max_chars = 1234
+            source_max_chars = 6789
+            timeout_secs = 7
+            max_passes = 9
+        "#,
+        )
+        .unwrap();
+        let paths: Vec<_> = cfg
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == "context_compression_unsupported")
+            .map(|warning| warning.path)
+            .collect();
+        assert_eq!(
+            paths,
+            ["runtime_profiles.test.context_compression.max_passes"]
+        );
+    }
+
     // agent-level summary_provider validated like classifier_provider.
     #[tokio::test]
     async fn config_validate_rejects_agent_summary_provider_missing_alias() {
@@ -52833,16 +52880,13 @@ allowed_users = []
             cfg.effective_summary_provider("b").as_deref(),
             Some("custom.profilesum")
         );
-        // no agent override + no runtime profile → None (caller uses agent's own)
+        // no agent override + no runtime profile → None (no rolling summary)
         assert_eq!(cfg.effective_summary_provider("c"), None);
     }
 
-    // The runtime context compressor was removed; nothing reads
-    // `context_compression` at runtime anymore, so an explicit
-    // `enabled = true` on a named runtime profile is inert and must be
-    // flagged.
+    // Enabled rolling history summaries no longer emit an unsupported warning.
     #[tokio::test]
-    async fn collect_warnings_flags_context_compression_enabled_on_runtime_profile() {
+    async fn collect_warnings_accepts_context_compression_enabled_on_runtime_profile() {
         let toml = r#"
             [risk_profiles.default]
             level = "supervised"
@@ -52857,15 +52901,10 @@ allowed_users = []
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         let warnings = cfg.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "context_compression_unsupported")
-            .expect("expected context_compression_unsupported warning");
-        assert_eq!(w.path, "runtime_profiles.fast.context_compression.enabled");
         assert!(
-            w.message.contains("not currently implemented"),
-            "message explains the flag is inert: {}",
-            w.message
+            !warnings
+                .iter()
+                .any(|w| w.code == "context_compression_unsupported")
         );
     }
 
@@ -52875,7 +52914,7 @@ allowed_users = []
     // migrated — this is the historical form of the surface commonly
     // called "agent-level" configuration.
     #[::core::prelude::v1::test]
-    fn collect_warnings_flags_context_compression_enabled_via_legacy_agent_table() {
+    fn collect_warnings_accepts_context_compression_enabled_via_legacy_agent_table() {
         let raw = r#"
             default_temperature = 0.7
 
@@ -52884,19 +52923,15 @@ allowed_users = []
         "#;
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         let warnings = parsed.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "context_compression_unsupported")
-            .expect("expected context_compression_unsupported warning after migration");
-        assert_eq!(
-            w.path,
-            "runtime_profiles.default.context_compression.enabled"
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "context_compression_unsupported")
         );
     }
 
     // A default config (no explicit `context_compression.enabled`) must stay
-    // silent — the flag now defaults to `false`, matching the runtime, which
-    // does not consult it at all.
+    // silent. Rolling summaries are opt-in and the flag defaults to `false`.
     #[tokio::test]
     async fn collect_warnings_silent_for_context_compression_default() {
         let toml = r#"
@@ -52917,10 +52952,8 @@ allowed_users = []
         );
     }
 
-    // Every `context_compression` knob is inert, not just `enabled` — tuning
-    // fields set to non-default values must each surface their own warning
-    // with a per-field path, even with `enabled` left off, since the whole
-    // struct is covered.
+    // Legacy compressor controls remain inert and retain per-field warnings,
+    // including when the rolling-summary gate is disabled.
     #[tokio::test]
     async fn collect_warnings_flags_context_compression_tuning_fields() {
         let toml = r#"
