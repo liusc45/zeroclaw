@@ -350,11 +350,8 @@ fn default_tool_result_retrim_chars() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
-    /// The runtime context compressor was removed; no runtime execution path
-    /// consumes this flag, so setting it to `true` currently has no effect.
-    /// Defaults to `false` to match actual runtime behavior;
-    /// `Config::collect_warnings` reads an explicit `true` only to report
-    /// `context_compression_unsupported`.
+    /// Enable rolling summaries of trimmed channel history when an effective
+    /// summary_provider is configured. Other execution paths retain plain trimming.
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
     #[serde(default = "default_threshold_ratio")]
@@ -365,10 +362,13 @@ pub struct ContextCompressionConfig {
     pub protect_last_n: usize,
     #[serde(default = "default_cc_max_passes")]
     pub max_passes: u32,
+    /// Maximum rolling-summary characters. Zero uses 4000.
     #[serde(default = "default_summary_max_chars")]
     pub summary_max_chars: usize,
+    /// Maximum source characters, including the previous summary. Zero uses 50000.
     #[serde(default = "default_source_max_chars")]
     pub source_max_chars: usize,
+    /// Background summary attempt timeout, including provider setup. Zero uses 60 seconds.
     #[serde(default = "default_cc_timeout_secs")]
     pub timeout_secs: u64,
     /// Summarizer provider as a `<type>.<alias>` reference into `providers.models`.

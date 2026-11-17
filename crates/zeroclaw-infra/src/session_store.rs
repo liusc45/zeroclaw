@@ -72,6 +72,19 @@ impl SessionStore {
         ))
     }
 
+    fn summary_path(&self, session_key: &str) -> PathBuf {
+        self.sessions_dir
+            .join(format!("{}.summary", sanitize_session_key(session_key)))
+    }
+
+    fn remove_summary(&self, session_key: &str) -> std::io::Result<bool> {
+        match std::fs::remove_file(self.summary_path(session_key)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Persist whether the session's transcript starts with the synthetic
     /// trim breadcrumb. Respects the migration fence: fails if the JSONL
     /// store has been migrated to SQLite.
@@ -320,6 +333,7 @@ impl SessionStore {
     pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
         let _guard = self.mutation_guard()?;
         let _ = std::fs::remove_file(self.trim_breadcrumb_path(session_key));
+        self.remove_summary(session_key)?;
         if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
             return Ok(0);
         }
@@ -343,10 +357,11 @@ impl SessionStore {
     fn delete_session_unlocked(&self, session_key: &str) -> std::io::Result<bool> {
         let path = self.session_path(session_key);
         let crumb_path = self.trim_breadcrumb_path(session_key);
+        let had_summary = self.remove_summary(session_key)?;
         if !is_regular_jsonl_session_file(&path) {
             let had_crumb = crumb_path.exists();
             let _ = std::fs::remove_file(&crumb_path);
-            return Ok(had_crumb);
+            return Ok(had_crumb || had_summary);
         }
         std::fs::remove_file(&path)?;
         let _ = std::fs::remove_file(crumb_path);
@@ -542,6 +557,26 @@ impl SessionBackend for SessionStore {
     fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
         let _guard = self.mutation_guard()?;
         self.rewrite(session_key, messages)
+    }
+
+    fn set_session_summary(&self, session_key: &str, summary: Option<&str>) -> std::io::Result<()> {
+        let _guard = self.mutation_guard()?;
+        if let Some(summary) = summary {
+            let path = self.summary_path(session_key);
+            let temporary = path.with_extension("summary.tmp");
+            std::fs::write(&temporary, summary)?;
+            std::fs::rename(temporary, path)
+        } else {
+            self.remove_summary(session_key).map(|_| ())
+        }
+    }
+
+    fn get_session_summary(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        match std::fs::read_to_string(self.summary_path(session_key)) {
+            Ok(summary) => Ok(Some(summary)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
@@ -752,10 +787,12 @@ mod tests {
                     "running",
                     Some("turn"),
                     Some("user:alice"),
-                    &|_| Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "revoked"
-                    ))
+                    &|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "revoked",
+                        ))
+                    }
                 )
                 .is_err()
         );
@@ -824,6 +861,28 @@ mod tests {
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "hi there");
+    }
+
+    #[test]
+    fn rolling_summary_round_trip_and_reset() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        assert_eq!(store.get_session_summary("chat").unwrap(), None);
+        store
+            .set_session_summary("chat", Some("- Fecha: 2030-02-03; €42"))
+            .unwrap();
+        let reopened = SessionStore::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.get_session_summary("chat").unwrap().as_deref(),
+            Some("- Fecha: 2030-02-03; €42")
+        );
+        reopened.clear_messages("chat").unwrap();
+        assert_eq!(store.get_session_summary("chat").unwrap(), None);
+        store
+            .set_session_summary("chat", Some("summary only"))
+            .unwrap();
+        assert!(store.delete_session("chat").unwrap());
+        assert_eq!(store.get_session_summary("chat").unwrap(), None);
     }
 
     #[test]
