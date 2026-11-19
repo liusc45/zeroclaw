@@ -7,7 +7,9 @@
 //!
 //! Wire protocol (from the plugin source, not the leftover proto default
 //! host):
-//! - Base URL: `https://www.kimi.com/api-claw` (`bridge.kimiapiHost`)
+//! - Host: `https://www.kimi.com/api-claw` (`bridge.kimiapiHost`, the
+//!   installer's `--kimiapi-host` default); IM RPC calls go to the
+//!   `/api-ws` rewrite of it, exactly like the plugin's RPC client
 //! - Auth: `X-Kimi-Bot-Token`
 //! - Subscribe: Buf Connect streaming JSON POST to
 //!   `/kimi.gateway.im.v1.IMService/Subscribe`
@@ -35,7 +37,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
@@ -65,12 +67,34 @@ const PING_TIMEOUT: Duration = Duration::from_secs(30);
 const UNARY_TIMEOUT: Duration = Duration::from_secs(20);
 /// How many recent inbound message ids are remembered for de-duplication.
 const SEEN_CAPACITY: usize = 512;
+/// TCP/TLS connect budget for every IM RPC.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// A stream must stay up this long (with pings) before backoff resets; the
+/// server sends a ping right after connecting, so one ping is not enough.
+const STABLE_STREAM: Duration = Duration::from_secs(60);
+/// Upper bound for one Connect frame; IM events are a few hundred bytes.
+const MAX_CONNECT_FRAME_LEN: usize = 4 * 1024 * 1024;
+
+/// Authentication was rejected (HTTP 401/403 or Connect `unauthenticated` /
+/// `permission_denied`). The listener stops instead of retrying forever.
+#[derive(Debug)]
+struct KimiAuthError(String);
+
+impl std::fmt::Display for KimiAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Kimi Claw auth failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for KimiAuthError {}
 
 /// A ZeroClaw channel bound to one `[channels.kimi_claw.<alias>]` instance.
 pub struct KimiClawChannel {
     token: String,
     alias: String,
     api_host: String,
+    /// IM RPC base derived from `api_host` (`/api-claw` -> `/api-ws`).
+    rpc_base: String,
     user_id: Option<String>,
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     proxy_url: Option<String>,
@@ -79,8 +103,13 @@ pub struct KimiClawChannel {
     last_event_id: Arc<RwLock<Option<String>>>,
     seen_message_ids: Mutex<VecDeque<String>>,
     subscribe_healthy: AtomicBool,
-    /// Set when the current stream delivered a ping; resets backoff.
-    saw_ping: AtomicBool,
+    /// Set once the current stream has been up for `STABLE_STREAM` and is
+    /// still pinging; only then is the reconnect backoff reset.
+    stream_stable: AtomicBool,
+    /// One client per channel: no redirects (the bot token is a custom header
+    /// reqwest would not strip on a cross-origin redirect) and a connect
+    /// timeout; the subscribe body itself may stream indefinitely.
+    client: OnceLock<reqwest::Client>,
 }
 
 impl KimiClawChannel {
@@ -93,6 +122,7 @@ impl KimiClawChannel {
             token,
             alias: alias.into(),
             api_host: DEFAULT_API_HOST.to_string(),
+            rpc_base: im_rpc_base_url(DEFAULT_API_HOST),
             user_id: None,
             peer_resolver,
             proxy_url: None,
@@ -100,7 +130,8 @@ impl KimiClawChannel {
             last_event_id: Arc::new(RwLock::new(None)),
             seen_message_ids: Mutex::new(VecDeque::with_capacity(SEEN_CAPACITY)),
             subscribe_healthy: AtomicBool::new(false),
-            saw_ping: AtomicBool::new(false),
+            stream_stable: AtomicBool::new(false),
+            client: OnceLock::new(),
         }
     }
 
@@ -111,6 +142,7 @@ impl KimiClawChannel {
     pub fn with_api_host(mut self, api_host: Option<String>) -> Self {
         if let Some(host) = api_host.filter(|h| !h.trim().is_empty()) {
             self.api_host = normalize_base_url(&host);
+            self.rpc_base = im_rpc_base_url(&self.api_host);
         }
         self
     }
@@ -126,10 +158,23 @@ impl KimiClawChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        zeroclaw_config::schema::build_channel_proxy_client(
-            "channel.kimi_claw",
-            self.proxy_url.as_deref(),
-        )
+        self.client
+            .get_or_init(|| {
+                let base = || {
+                    reqwest::Client::builder()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .connect_timeout(CONNECT_TIMEOUT)
+                };
+                zeroclaw_config::schema::apply_channel_proxy_to_builder(
+                    base(),
+                    "channel.kimi_claw",
+                    self.proxy_url.as_deref(),
+                )
+                .build()
+                .or_else(|_| base().build())
+                .unwrap_or_default()
+            })
+            .clone()
     }
 
     /// Deny-by-default, like Telegram: a sender is admitted only by a peer
@@ -158,7 +203,8 @@ impl KimiClawChannel {
 
     fn auth_headers(&self, streaming: bool) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
-        if let Ok(value) = reqwest::header::HeaderValue::from_str(&self.token) {
+        if let Ok(mut value) = reqwest::header::HeaderValue::from_str(self.token.trim()) {
+            value.set_sensitive(true);
             headers.insert(AUTH_HEADER, value);
         }
         if let Ok(value) = reqwest::header::HeaderValue::from_str(&Self::version_header_value()) {
@@ -203,10 +249,10 @@ impl KimiClawChannel {
             return Ok(trimmed.to_string());
         }
         self.last_chat_id.read().await.clone().ok_or_else(|| {
-            anyhow::anyhow!(
+            anyhow::Error::msg(format!(
                 "No Kimi Claw chat id is known for this session. \
                      The user must send a message first, or set the recipient to a chat id."
-            )
+            ))
         })
     }
 }
@@ -231,7 +277,7 @@ impl Channel for KimiClawChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let chat_id = self.resolve_outbound_chat_id(&message.recipient).await?;
         let request = build_send_message_request(&chat_id, &message.content)?;
-        let url = join_url(&self.api_host, SEND_MESSAGE_PATH);
+        let url = join_url(&self.rpc_base, SEND_MESSAGE_PATH);
         let resp = self
             .http_client()
             .post(&url)
@@ -260,13 +306,16 @@ impl Channel for KimiClawChannel {
         if self.token.trim().is_empty() {
             anyhow::bail!("Kimi Claw channel is missing bot token (`channels.kimi_claw.*.token`)");
         }
+        if reqwest::header::HeaderValue::from_str(self.token.trim()).is_err() {
+            anyhow::bail!("Kimi Claw bot token contains characters that are not valid in a header");
+        }
 
         let mut backoff = DEFAULT_RETRY_BASE;
         loop {
-            self.saw_ping.store(false, Ordering::Relaxed);
+            self.stream_stable.store(false, Ordering::Relaxed);
             let result = self.subscribe_once(&tx).await;
             self.subscribe_healthy.store(false, Ordering::Relaxed);
-            if self.saw_ping.load(Ordering::Relaxed) {
+            if self.stream_stable.load(Ordering::Relaxed) {
                 backoff = DEFAULT_RETRY_BASE;
             }
             match result {
@@ -330,24 +379,26 @@ impl KimiClawChannel {
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<SubscribeEnd> {
-        let url = join_url(&self.api_host, SUBSCRIBE_PATH);
+        let url = join_url(&self.rpc_base, SUBSCRIBE_PATH);
         let since_id = self.last_event_id.read().await.clone();
         let body = encode_connect_envelope(&build_subscribe_request(since_id.as_deref()));
-        let resp = self
+        let request = self
             .http_client()
             .post(&url)
             .headers(self.auth_headers(true))
             .body(body)
-            .send()
+            .send();
+        // Bound the wait for response headers; the body then streams freely.
+        let resp = tokio::time::timeout(UNARY_TIMEOUT, request)
             .await
-            .map_err(|err| anyhow::anyhow!("Subscribe request failed: {err}"))?;
+            .map_err(|_| anyhow::Error::msg("Subscribe timed out waiting for response headers"))?
+            .map_err(|err| anyhow::Error::msg(format!("Subscribe request failed: {err}")))?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED
             || resp.status() == reqwest::StatusCode::FORBIDDEN
         {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Kimi Claw auth failed ({status}): {}", truncate(&text, 200));
+            // Never echo the body of an auth failure.
+            return Err(KimiAuthError(format!("HTTP {}", resp.status())).into());
         }
         if !resp.status().is_success() {
             let status = resp.status();
@@ -373,7 +424,7 @@ impl KimiClawChannel {
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
                 ::serde_json::json!({
-                    "host": self.api_host,
+                    "host": self.rpc_base,
                     "alias": self.alias,
                     "resumed": since_id.is_some(),
                     "has_user_id": self.user_id.is_some(),
@@ -384,36 +435,58 @@ impl KimiClawChannel {
 
         let mut stream = resp.bytes_stream();
         let mut buf = Vec::new();
+        let connected_at = tokio::time::Instant::now();
+        // Independent ping deadline: only server pings extend it, so partial
+        // frames or other traffic cannot keep a dead session alive.
+        let mut ping_deadline = connected_at + PING_TIMEOUT;
         loop {
-            let chunk = match tokio::time::timeout(PING_TIMEOUT, stream.next()).await {
+            let chunk = match tokio::time::timeout_at(ping_deadline, stream.next()).await {
                 Err(_) => return Ok(SubscribeEnd::PingTimeout),
                 Ok(None) => return Ok(SubscribeEnd::Closed),
-                Ok(Some(chunk)) => {
-                    chunk.map_err(|err| anyhow::anyhow!("Subscribe stream read failed: {err}"))?
-                }
+                Ok(Some(chunk)) => chunk.map_err(|err| {
+                    anyhow::Error::msg(format!("Subscribe stream read failed: {err}"))
+                })?,
             };
             buf.extend_from_slice(&chunk);
             while let Some(envelope) = pop_connect_envelope(&mut buf)? {
                 if envelope.end_stream {
                     if let Some(err) = connect_end_stream_error(&envelope.payload_text) {
+                        if err.is_auth() {
+                            return Err(KimiAuthError(format!("Connect {}", err.code)).into());
+                        }
                         anyhow::bail!("Subscribe stream failed: {err}");
                     }
                     return Ok(SubscribeEnd::Closed);
                 }
                 let event = &envelope.payload;
+                let event_id = first_string(event, &["id"]);
                 match classify_event(event) {
                     EventKind::Ping => {
-                        self.saw_ping.store(true, Ordering::Relaxed);
+                        let now = tokio::time::Instant::now();
+                        ping_deadline = now + PING_TIMEOUT;
+                        if now.duration_since(connected_at) >= STABLE_STREAM {
+                            self.stream_stable.store(true, Ordering::Relaxed);
+                        }
                     }
-                    EventKind::Reconnect => return Ok(SubscribeEnd::ServerReconnect),
+                    EventKind::Reconnect => {
+                        // Record it first so the next Subscribe resumes past it
+                        // instead of replaying the reconnect request forever.
+                        if let Some(id) = event_id {
+                            *self.last_event_id.write().await = Some(id);
+                        }
+                        return Ok(SubscribeEnd::ServerReconnect);
+                    }
                     EventKind::ChatMessage => {
                         if let Some(meta) = parse_chat_event(event, self.user_id.as_deref()) {
+                            // An error here (e.g. ListMessages failed) ends the
+                            // stream before the cursor moves, so the event is
+                            // replayed after reconnect.
                             self.dispatch_chat_event(meta, tx).await?;
                         }
                     }
                     EventKind::Other => {}
                 }
-                if let Some(id) = first_string(event, &["id"]) {
+                if let Some(id) = event_id {
                     *self.last_event_id.write().await = Some(id);
                 }
             }
@@ -437,61 +510,80 @@ impl KimiClawChannel {
             );
             return Ok(());
         }
-        if !self.mark_seen(&meta.message_id) {
+        if self.is_seen(&meta.message_id) {
             return Ok(());
         }
         let mut inbound = meta;
         if inbound.text.is_empty() {
-            match self
+            let text = self
                 .fetch_message_text(&inbound.chat_id, &inbound.message_id)
                 .await
-            {
-                Ok(text) if !text.is_empty() => inbound.text = text,
-                Ok(_) | Err(_) if inbound.summary.is_some() => {
-                    inbound.text = inbound.summary.clone().unwrap_or_default();
-                }
-                Ok(_) => return Ok(()),
-                Err(err) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .map_err(|err| {
+                    anyhow::Error::msg(format!(
+                        "ListMessages failed for message {}: {err}",
+                        inbound.message_id
+                    ))
+                })?;
+            if text.is_empty() {
+                // Non-text message (file, card, ...). Fall back to the
+                // server-provided summary only when the fetch succeeded.
+                match inbound.summary.take().filter(|s| !s.is_empty()) {
+                    Some(summary) => inbound.text = summary,
+                    None => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
                             .with_attrs(::serde_json::json!({
-                                "chat_id": inbound.chat_id,
                                 "message_id": inbound.message_id,
-                                "error": err.to_string(),
                             })),
-                        "kimi claw listMessages failed; inbound dropped"
-                    );
-                    return Ok(());
+                            "kimi claw inbound has no text content; skipped"
+                        );
+                        self.mark_seen(&inbound.message_id);
+                        return Ok(());
+                    }
                 }
+            } else {
+                inbound.text = text;
             }
         }
+        let message_id = inbound.message_id.clone();
         self.remember_chat_id(&inbound.chat_id).await;
         if tx.send(self.to_channel_message(inbound)).await.is_err() {
             anyhow::bail!("message channel closed");
         }
+        // Only a delivered message is remembered, so a failed fetch or send
+        // is retried when the event is replayed.
+        self.mark_seen(&message_id);
         Ok(())
     }
 
-    /// Returns `true` the first time a message id is seen.
-    fn mark_seen(&self, message_id: &str) -> bool {
+    fn is_seen(&self, message_id: &str) -> bool {
+        self.seen_message_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|id| id == message_id)
+    }
+
+    fn mark_seen(&self, message_id: &str) {
         let mut seen = self
             .seen_message_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if seen.iter().any(|id| id == message_id) {
-            return false;
+            return;
         }
         if seen.len() >= SEEN_CAPACITY {
             seen.pop_front();
         }
         seen.push_back(message_id.to_string());
-        true
     }
 
     async fn fetch_message_text(&self, chat_id: &str, message_id: &str) -> anyhow::Result<String> {
-        let url = join_url(&self.api_host, LIST_MESSAGES_PATH);
+        let url = join_url(&self.rpc_base, LIST_MESSAGES_PATH);
         let resp = self
             .http_client()
             .post(&url)
@@ -653,6 +745,25 @@ fn with_jitter(base: Duration) -> Duration {
     base + Duration::from_millis(extra)
 }
 
+/// The configured host mirrors the plugin's `bridge.kimiapiHost`
+/// (`https://www.kimi.com/api-claw`), but the plugin's IM RPC client
+/// (`resolveStaticImRpcBaseUrl`) swaps a leading `/api-claw` path segment for
+/// `/api-ws`; the IM service is only served there (`/api-claw/...` is 404).
+pub(crate) fn im_rpc_base_url(api_host: &str) -> String {
+    let base = normalize_base_url(api_host);
+    let Some(scheme_end) = base.find("://") else {
+        return base;
+    };
+    let path_start = base[scheme_end + 3..]
+        .find('/')
+        .map_or(base.len(), |i| scheme_end + 3 + i);
+    let (origin, path) = base.split_at(path_start);
+    match path.strip_prefix("/api-claw") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{origin}/api-ws{rest}"),
+        _ => base,
+    }
+}
+
 pub(crate) fn normalize_base_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
@@ -675,12 +786,16 @@ fn pop_connect_envelope(buf: &mut Vec<u8>) -> anyhow::Result<Option<ConnectEnvel
         return Ok(None);
     }
     let flags = buf[0];
-    let len = u32::from_be_bytes(buf[1..5].try_into().expect("4-byte length")) as usize;
-    if buf.len() < 5 + len {
-        return Ok(None);
-    }
+    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    // Validate the header before buffering the body.
     if flags & CONNECT_FLAG_COMPRESSED != 0 {
         anyhow::bail!("compressed Connect envelopes are not supported");
+    }
+    if len > MAX_CONNECT_FRAME_LEN {
+        anyhow::bail!("Connect frame of {len} bytes exceeds {MAX_CONNECT_FRAME_LEN}");
+    }
+    if buf.len() < 5 + len {
+        return Ok(None);
     }
     let payload_bytes = buf[5..5 + len].to_vec();
     buf.drain(..5 + len);
@@ -689,7 +804,7 @@ fn pop_connect_envelope(buf: &mut Vec<u8>) -> anyhow::Result<Option<ConnectEnvel
         Value::Null
     } else {
         serde_json::from_str(&payload_text)
-            .map_err(|err| anyhow::anyhow!("invalid Connect JSON: {err}"))?
+            .map_err(|err| anyhow::Error::msg(format!("invalid Connect JSON: {err}")))?
     };
     Ok(Some(ConnectEnvelope {
         flags,
@@ -699,7 +814,25 @@ fn pop_connect_envelope(buf: &mut Vec<u8>) -> anyhow::Result<Option<ConnectEnvel
     }))
 }
 
-fn connect_end_stream_error(payload_text: &str) -> Option<String> {
+#[derive(Debug, PartialEq, Eq)]
+struct ConnectStreamError {
+    code: String,
+    message: String,
+}
+
+impl ConnectStreamError {
+    fn is_auth(&self) -> bool {
+        matches!(self.code.as_str(), "unauthenticated" | "permission_denied")
+    }
+}
+
+impl std::fmt::Display for ConnectStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "code={} message={}", self.code, self.message)
+    }
+}
+
+fn connect_end_stream_error(payload_text: &str) -> Option<ConnectStreamError> {
     let parsed: Value = serde_json::from_str(payload_text).ok()?;
     let error = parsed.get("error")?;
     let code = error
@@ -710,7 +843,10 @@ fn connect_end_stream_error(payload_text: &str) -> Option<String> {
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or("connect stream failed");
-    Some(format!("code={code} message={message}"))
+    Some(ConnectStreamError {
+        code: code.to_string(),
+        message: truncate(message, 200),
+    })
 }
 
 pub(crate) fn build_send_message_request(chat_id: &str, text: &str) -> anyhow::Result<Value> {
@@ -741,7 +877,11 @@ fn regex_lite_replace(text: &str) -> String {
             && let Some(end) = rest.find('>')
         {
             let inner = &rest[2..end];
-            if inner.contains('|') && !inner.contains('\n') {
+            let well_formed = !inner.contains(['<', '\n'])
+                && inner
+                    .split_once('|')
+                    .is_some_and(|(id, name)| !id.is_empty() && !name.is_empty());
+            if well_formed {
                 out.push(' ');
                 rest = &rest[end + 1..];
                 continue;
@@ -756,7 +896,7 @@ fn regex_lite_replace(text: &str) -> String {
 
 fn parse_chat_event(event: &Value, self_id: Option<&str>) -> Option<InboundMessage> {
     let chat = event_chat_message(event)?;
-    if !is_completed(chat) || is_non_user_role(chat) {
+    if !is_completed(chat) || !is_user_role_or_unset(chat) {
         return None;
     }
     let message_id = first_string(chat, &["messageId", "message_id"])?;
@@ -807,22 +947,21 @@ fn event_chat_message(event: &Value) -> Option<&Value> {
     None
 }
 
-fn is_non_user_role(chat: &Value) -> bool {
-    let role = chat
+/// Only `user` messages (or events without a role, which the plugin also
+/// dispatches) reach the agent. kimi.chat.v1.Role: ROLE_UNSPECIFIED=0,
+/// system=1, user=2, assistant=3.
+fn is_user_role_or_unset(chat: &Value) -> bool {
+    let Some(role) = chat
         .get("role")
         .or_else(|| chat.get("message").and_then(|m| m.get("role")))
-        .and_then(|v| {
-            v.as_str()
-                .map(ToOwned::to_owned)
-                .or_else(|| v.as_i64().map(|n| n.to_string()))
-        })
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    // kimi.chat.v1.Role: ROLE_UNSPECIFIED=0, system=1, user=2, assistant=3.
-    matches!(
-        role.as_str(),
-        "assistant" | "bot" | "system" | "role_assistant" | "role_system" | "1" | "3"
-    )
+    else {
+        return true;
+    };
+    match role {
+        Value::String(s) => matches!(s.to_ascii_lowercase().as_str(), "user" | "role_user"),
+        Value::Number(n) => n.as_i64() == Some(2),
+        _ => false,
+    }
 }
 
 fn extract_message_text(chat: &Value) -> String {
@@ -917,8 +1056,7 @@ fn now_secs() -> u64 {
 }
 
 fn is_auth_failure(err: &anyhow::Error) -> bool {
-    let text = err.to_string();
-    text.contains("auth failed") || text.contains("401") || text.contains("403")
+    err.downcast_ref::<KimiAuthError>().is_some()
 }
 
 #[cfg(test)]
@@ -949,12 +1087,19 @@ mod tests {
 
     #[test]
     fn end_stream_error_is_extracted() {
-        let msg = connect_end_stream_error(
+        let err = connect_end_stream_error(
             r#"{"error":{"code":"unauthenticated","message":"token expired"}}"#,
         )
         .unwrap();
-        assert!(msg.contains("unauthenticated"));
-        assert!(msg.contains("token expired"));
+        assert!(err.is_auth());
+        assert!(err.to_string().contains("token expired"));
+        let other =
+            connect_end_stream_error(r#"{"error":{"code":"unavailable","message":"403 hops"}}"#)
+                .unwrap();
+        assert!(!other.is_auth());
+        let auth: anyhow::Error = KimiAuthError("HTTP 401".into()).into();
+        assert!(is_auth_failure(&auth));
+        assert!(!is_auth_failure(&anyhow::anyhow!("status 403 from proxy")));
     }
 
     #[test]
@@ -1047,9 +1192,32 @@ mod tests {
         assert_eq!(DEFAULT_API_HOST, "https://www.kimi.com/api-claw");
         assert!(!DEFAULT_API_HOST.contains("dev.kimi.team"));
         assert_eq!(
-            join_url(DEFAULT_API_HOST, SUBSCRIBE_PATH),
-            "https://www.kimi.com/api-claw/kimi.gateway.im.v1.IMService/Subscribe"
+            join_url(&im_rpc_base_url(DEFAULT_API_HOST), SUBSCRIBE_PATH),
+            "https://www.kimi.com/api-ws/kimi.gateway.im.v1.IMService/Subscribe"
         );
+    }
+
+    #[test]
+    fn im_rpc_base_rewrites_only_leading_api_claw_segment() {
+        assert_eq!(
+            im_rpc_base_url("https://www.kimi.com/api-claw/"),
+            "https://www.kimi.com/api-ws"
+        );
+        assert_eq!(
+            im_rpc_base_url("https://proxy.example/api-claw/x"),
+            "https://proxy.example/api-ws/x"
+        );
+        assert_eq!(
+            im_rpc_base_url("https://www.kimi.com/api-clawz"),
+            "https://www.kimi.com/api-clawz"
+        );
+        assert_eq!(
+            im_rpc_base_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080"
+        );
+        let ch = KimiClawChannel::new("t".into(), "a", Arc::new(Vec::new))
+            .with_api_host(Some("https://www.kimi.com/api-claw".into()));
+        assert_eq!(ch.rpc_base, "https://www.kimi.com/api-ws");
     }
 
     #[test]
@@ -1169,12 +1337,13 @@ mod tests {
     #[test]
     fn duplicate_message_ids_are_dropped() {
         let channel = KimiClawChannel::new("t".into(), "default", Arc::new(Vec::new));
-        assert!(channel.mark_seen("m1"));
-        assert!(!channel.mark_seen("m1"));
+        assert!(!channel.is_seen("m1"));
+        channel.mark_seen("m1");
+        assert!(channel.is_seen("m1"));
         for i in 0..SEEN_CAPACITY {
             channel.mark_seen(&format!("x{i}"));
         }
-        assert!(channel.mark_seen("m1"));
+        assert!(!channel.is_seen("m1"));
     }
 
     #[test]
@@ -1187,6 +1356,76 @@ mod tests {
             KimiClawChannel::new("t".into(), "default", Arc::new(|| vec!["ada".to_string()]));
         assert!(by_short.is_sender_allowed("u1", Some("ada")));
         assert!(!by_short.is_sender_allowed("u2", Some("bob")));
+    }
+
+    #[test]
+    fn oversized_or_compressed_frames_are_rejected_from_the_header() {
+        let mut big = vec![0u8];
+        big.extend_from_slice(&((MAX_CONNECT_FRAME_LEN as u32) + 1).to_be_bytes());
+        assert!(pop_connect_envelope(&mut big).is_err());
+        let mut compressed = vec![CONNECT_FLAG_COMPRESSED, 0, 0, 0, 10];
+        assert!(pop_connect_envelope(&mut compressed).is_err());
+    }
+
+    #[test]
+    fn coalesced_frames_are_split() {
+        let mut buf = encode_connect_envelope(&json!({"ping": {}}));
+        buf.extend(encode_connect_envelope(
+            &json!({"id": "e1", "botReport": {}}),
+        ));
+        assert_eq!(
+            classify_event(&pop_connect_envelope(&mut buf).unwrap().unwrap().payload),
+            EventKind::Ping
+        );
+        assert_eq!(
+            classify_event(&pop_connect_envelope(&mut buf).unwrap().unwrap().payload),
+            EventKind::Other
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn malformed_mentions_do_not_swallow_text() {
+        assert_eq!(
+            strip_im_textual_mentions("a <@ b <@u1|Ada> c"),
+            "a <@ b   c".trim()
+        );
+        assert_eq!(strip_im_textual_mentions("<@|x> keep"), "<@|x> keep");
+    }
+
+    #[test]
+    fn unspecified_or_unknown_roles_are_not_users() {
+        for role in [json!(0), json!(1), json!(3), json!("tool")] {
+            let event = json!({"chatMessage": {
+                "chatId": "c1", "messageId": "m1", "senderId": "u1", "status": 2, "role": role
+            }});
+            assert!(parse_chat_event(&event, None).is_none());
+        }
+    }
+
+    /// Live, read-only smoke test against kimi.com. With no peer group every
+    /// sender is denied before any ListMessages call, and nothing is sent.
+    /// Run: `KIMI_CLAW_LIVE_TOKEN=... cargo test -p zeroclaw-channels
+    /// --features channel-kimi-claw --lib kimi_claw::tests::live -- --ignored`
+    #[tokio::test]
+    #[ignore = "live: needs KIMI_CLAW_LIVE_TOKEN; read-only subscribe"]
+    async fn live_subscribe_smoke() {
+        let Ok(token) = std::env::var("KIMI_CLAW_LIVE_TOKEN") else {
+            return;
+        };
+        let channel = Arc::new(KimiClawChannel::new(token, "live", Arc::new(Vec::new)));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let listener = Arc::clone(&channel);
+        let task = tokio::spawn(async move { listener.listen(tx).await });
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let healthy = channel.health_check().await;
+        let finished = task.is_finished();
+        task.abort();
+        assert!(
+            !finished,
+            "listener exited early (auth or protocol failure)"
+        );
+        assert!(healthy, "subscribe stream did not connect");
     }
 
     #[test]

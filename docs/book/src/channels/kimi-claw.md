@@ -12,7 +12,7 @@ The channel is compiled into default builds (`channel-kimi-claw` is part of
 
 ```mermaid
 flowchart LR
-    K["kimi.com IM service<br/>/api-claw"] -->|"Subscribe (Connect stream)"| C["KimiClawChannel<br/>alias = home"]
+    K["kimi.com IM service<br/>/api-ws"] -->|"Subscribe (Connect stream)"| C["KimiClawChannel<br/>alias = home"]
     C -->|"ListMessages (message text)"| K
     P["peer groups<br/>authorized Kimi senders"] --> C
     C -->|"authorized ChannelMessage"| R["AgentRouter"]
@@ -21,7 +21,7 @@ flowchart LR
 
 - **Auth:** every request carries the bot token in `X-Kimi-Bot-Token`.
 - **Inbound:** a long-lived Buf Connect JSON stream on
-  `kimi.gateway.im.v1.IMService/Subscribe`. Events carry only metadata, so for
+  `https://www.kimi.com/api-ws/kimi.gateway.im.v1.IMService/Subscribe`. Events carry only metadata, so for
   each completed user message the channel reads its text with a scoped
   `ListMessages` call, exactly like the official plugin.
 - **Outbound:** each reply is one unary `SendMessage` with a text block.
@@ -35,7 +35,17 @@ flowchart LR
 
 1. Open [kimi.com/bot](https://kimi.com/bot) and create or open your bot.
 2. Choose **Link Existing OpenClaw** (the same token works for ZeroClaw).
-3. Copy the bot token.
+3. Kimi shows an install command such as
+   `bash <(curl -fsSL https://cdn.kimi.com/kimi-claw/claw-install.sh) --bot-token km_b_prod_...`.
+   Do not run it for ZeroClaw: it installs the OpenClaw Node plugin. Copy only
+   the `km_b_...` value after `--bot-token`.
+
+| Official OpenClaw installer | ZeroClaw equivalent |
+|---|---|
+| `--bot-token <token>` | `zeroclaw config set channels.kimi_claw.<alias>.token` |
+| `--kimiapi-host <url>` | `channels.kimi_claw.<alias>.api_host` |
+| kimi-claw plugin (Node) | built-in `kimi_claw` channel |
+| optional `kimiim` CLI and OpenClaw skills | not installed; out of scope for the channel |
 
 Treat the token like a password. Do not paste it into `config.toml`, logs,
 screenshots, or source control.
@@ -70,7 +80,7 @@ channels = ["kimi_claw.home"]
 | `enabled` | yes | `false` | Start this channel instance. |
 | `token` | yes | — | Kimi Claw bot token (secret, stored encrypted). |
 | `user_id` | no | — | Bot's own Kimi id, used to drop its own messages. |
-| `api_host` | no | `https://www.kimi.com/api-claw` | IM RPC base URL override. |
+| `api_host` | no | `https://www.kimi.com/api-claw` | Same value as the installer's `--kimiapi-host`. A leading `/api-claw` path is rewritten to `/api-ws` for IM RPC calls, like the official plugin. |
 | `proxy_url` | no | global `[proxy]` | Per-channel proxy. |
 | `excluded_tools` | no | `[]` | Tools hidden from the model on this channel. |
 

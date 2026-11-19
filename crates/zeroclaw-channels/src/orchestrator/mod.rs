@@ -13617,7 +13617,11 @@ fn build_channel_by_id(
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                 let cfg_arc = config_arc.clone();
                 let alias = alias.clone();
-                Arc::new(move || cfg_arc.read().channel_external_peers("kimi_claw", &alias))
+                Arc::new(move || {
+                    cfg_arc
+                        .read()
+                        .channel_external_peers_for(&["kimi_claw", "kimi-claw", "kimiclaw"], &alias)
+                })
             };
             Ok(Arc::new(
                 KimiClawChannel::new(kc.token.clone(), alias, peer_resolver)
@@ -15805,6 +15809,7 @@ fn collect_configured_channels_with_authority(
     for (alias, kc) in &config.channels.kimi_claw {
         if !active_channel_aliases.contains(&format!("kimi_claw.{alias}"))
             && !active_channel_aliases.contains(&format!("kimi-claw.{alias}"))
+            && !active_channel_aliases.contains(&format!("kimiclaw.{alias}"))
         {
             continue;
         }
@@ -15823,7 +15828,11 @@ fn collect_configured_channels_with_authority(
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
             let cfg_arc = config_arc.clone();
             let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("kimi_claw", &alias))
+            Arc::new(move || {
+                cfg_arc
+                    .read()
+                    .channel_external_peers_for(&["kimi_claw", "kimi-claw", "kimiclaw"], &alias)
+            })
         };
         channels.push(ConfiguredChannel {
             display_name: "Kimi Claw",
