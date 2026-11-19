@@ -233,6 +233,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:twitter` | `twitter.rs` |
 | `channel:wechat` | `crates/zeroclaw-channels/src/wechat.rs` |
 | `channel:webhook` | `webhook.rs` |
+| `channel:kimi-claw` | `kimi_claw.rs` |
 | `channel:wecom` | `wecom.rs`, `wecom_ws.rs` |
 | `channel:whatsapp` | `whatsapp.rs`, `whatsapp_storage.rs`, `whatsapp_web.rs` |
 

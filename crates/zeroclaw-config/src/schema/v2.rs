@@ -87,6 +87,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "dingtalk",
     "wecom",
     "wecom_ws",
+    "kimi_claw",
     "wechat",
     "qq",
     "twitter",
@@ -1958,7 +1959,7 @@ fn fold_channel_peer_auth_into_peer_groups(
     let Some(field_name) = (match channel_type {
         "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "nextcloud_talk" | "irc"
         | "lark" | "line" | "feishu" | "dingtalk" | "wecom" | "wechat" | "qq" | "twitter"
-        | "mochat" => Some("allowed_users"),
+        | "mochat" | "kimi_claw" | "kimi-claw" | "kimiclaw" => Some("allowed_users"),
         "imessage" => Some("allowed_contacts"),
         "signal" => Some("allowed_from"),
         "whatsapp" => Some("allowed_numbers"),

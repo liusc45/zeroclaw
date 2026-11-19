@@ -183,6 +183,7 @@ default-channels = [
   "channel-discord",
   "channel-email",
   "channel-filesystem",
+  "channel-kimi-claw",
   "channel-telegram",
   "channel-webhook",
 ]
@@ -194,6 +195,7 @@ channels-full = [
   "channel-git",
   "channel-imessage",
   "channel-irc",
+  "channel-kimi-claw",
   "channel-lark",
   "channel-line",
   "channel-linq",
@@ -256,6 +258,7 @@ channel-slack = ["ws-transport"]
 channel-signal = ["dep:mime_guess"]
 channel-mattermost = ["ws-transport"]
 channel-irc = ["tls-client"]
+channel-kimi-claw = []
 channel-twitch = ["channel-irc"]
 channel-imessage = ["dep:rusqlite"]
 channel-dingtalk = ["ws-transport"]

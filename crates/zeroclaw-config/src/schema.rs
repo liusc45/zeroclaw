@@ -87,6 +87,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.slack",
     "channel.telegram",
     "channel.wechat",
+    "channel.kimi_claw",
     "channel.whatsapp",
     "tool.a2a",
     "tool.browser",
@@ -16391,6 +16392,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub wecom_ws: HashMap<String, WeComWsConfig>,
+    /// Kimi Claw IM channel instances (`[channels.kimi_claw.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub kimi_claw: HashMap<String, KimiClawConfig>,
     /// WeChat personal iLink Bot channel instances (`[channels.wechat.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -16649,6 +16654,13 @@ impl ChannelsConfig {
                 configured: !self.wecom_ws.is_empty(),
             },
             ChannelInfo {
+                kind: "kimi-claw",
+                config_key: "kimi_claw",
+                name: "Kimi Claw",
+                desc: "Kimi Claw IM (kimi.com)",
+                configured: !self.kimi_claw.is_empty(),
+            },
+            ChannelInfo {
                 kind: "wechat",
                 config_key: "wechat",
                 name: "WeChat",
@@ -16796,6 +16808,7 @@ impl ChannelsConfig {
             || self.dingtalk.values().any(|c| c.enabled)
             || self.wecom.values().any(|c| c.enabled)
             || self.wecom_ws.values().any(|c| c.enabled)
+            || self.kimi_claw.values().any(|c| c.enabled)
             || self.wechat.values().any(|c| c.enabled)
             || self.qq.values().any(|c| c.enabled)
             || self.twitter.values().any(|c| c.enabled)
@@ -16821,7 +16834,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -16843,6 +16856,7 @@ impl ChannelsConfig {
             ("dingtalk", !self.dingtalk.is_empty(), true),
             ("wecom", !self.wecom.is_empty(), true),
             ("wecom_ws", !self.wecom_ws.is_empty(), true),
+            ("kimi_claw", !self.kimi_claw.is_empty(), true),
             ("wechat", !self.wechat.is_empty(), true),
             ("qq", !self.qq.is_empty(), true),
             ("twitter", !self.twitter.is_empty(), true),
@@ -16929,6 +16943,7 @@ impl Default for ChannelsConfig {
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
             wecom_ws: HashMap::new(),
+            kimi_claw: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),
@@ -20708,6 +20723,70 @@ impl ChannelConfig for WeComWsConfig {
     }
     fn desc() -> &'static str {
         "WeCom AI Bot long connection"
+    }
+}
+
+/// Kimi Claw IM channel configuration.
+///
+/// Links a ZeroClaw agent to the official Kimi Claw IM service so users can
+/// chat with the agent from kimi.com. The token is issued by Kimi's
+/// "Link Existing OpenClaw" flow; this native channel speaks the same IM RPC
+/// protocol as the `kimi-claw` OpenClaw plugin.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.kimi_claw"]
+pub struct KimiClawConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bot token from Kimi Claw (`X-Kimi-Bot-Token`).
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub token: String,
+    /// Optional Kimi user id associated with the linked account.
+    #[tab(Connection)]
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// Override the IM RPC base URL. Default: `https://www.kimi.com/api-claw`.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub api_host: Option<String>,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+impl Default for KimiClawConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token: String::new(),
+            user_id: None,
+            api_host: None,
+            proxy_url: None,
+            excluded_tools: Vec::new(),
+        }
+    }
+}
+
+impl ChannelConfig for KimiClawConfig {
+    fn name() -> &'static str {
+        "Kimi Claw"
+    }
+    fn desc() -> &'static str {
+        "Kimi Claw IM (kimi.com)"
     }
 }
 
@@ -34837,6 +34916,23 @@ auto_save = true
         assert!(WeComWsConfig::prop_is_secret("channels.wecom_ws.secret"));
     }
 
+    #[tokio::test]
+    async fn kimi_claw_config_serde_defaults_and_secret_metadata() {
+        let toml = r#"
+            enabled = true
+            token = "test-token"
+            user_id = "user-1"
+        "#;
+        let parsed: KimiClawConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.token, "test-token");
+        assert_eq!(parsed.user_id.as_deref(), Some("user-1"));
+        assert!(parsed.api_host.is_none());
+        assert!(KimiClawConfig::default().token.is_empty());
+        assert!(!KimiClawConfig::default().enabled);
+        assert!(KimiClawConfig::prop_is_secret("channels.kimi_claw.token"));
+    }
+
     #[test]
     async fn config_parses_wecom_ws_separate_from_wecom_webhook() {
         let toml = r#"
@@ -34995,6 +35091,7 @@ auto_save = true
                 dingtalk: HashMap::new(),
                 wecom: HashMap::new(),
                 wecom_ws: HashMap::new(),
+                kimi_claw: HashMap::new(),
                 wechat: HashMap::new(),
                 qq: HashMap::new(),
                 twitter: HashMap::new(),
@@ -37418,6 +37515,7 @@ allowed_users = ["@u:matrix.org"]
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
             wecom_ws: HashMap::new(),
+            kimi_claw: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),
@@ -38037,6 +38135,7 @@ allowed_numbers = ["+1", "+2"]
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
             wecom_ws: HashMap::new(),
+            kimi_claw: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),

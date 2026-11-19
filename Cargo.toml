@@ -313,10 +313,12 @@ agent-runtime = [
 
 # Lean channel bundle included in `default`. These channels cover local/editor
 # ACP, gateway/webhook ingress, and common first-run external chat/email paths.
+# `channel-kimi-claw` adds no dependencies beyond reqwest/futures already used
+# by the default channels, so it ships in default builds (off until enabled).
 default-channels = [
     "channel-acp-server", "channel-webhook",
     "channel-email", "channel-telegram", "channel-discord",
-    "channel-filesystem",
+    "channel-filesystem", "channel-kimi-claw",
 ]
 
 # Historical broad channel bundle. Preserves the older default channel surface.
@@ -325,7 +327,7 @@ channels-full = [
     "channel-line",
     "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
-    "channel-dingtalk", "channel-qq", "channel-bluesky", "channel-git",
+    "channel-dingtalk", "channel-kimi-claw", "channel-qq", "channel-bluesky", "channel-git",
     "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
     "channel-linq", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
@@ -392,6 +394,7 @@ channel-irc = ["zeroclaw-channels/channel-irc"]
 channel-twitch = ["zeroclaw-channels/channel-twitch"]
 channel-imessage = ["zeroclaw-channels/channel-imessage"]
 channel-dingtalk = ["zeroclaw-channels/channel-dingtalk"]
+channel-kimi-claw = ["zeroclaw-channels/channel-kimi-claw"]
 channel-qq = ["zeroclaw-channels/channel-qq"]
 channel-bluesky = ["zeroclaw-channels/channel-bluesky"]
 channel-git = ["zeroclaw-channels/channel-git"]

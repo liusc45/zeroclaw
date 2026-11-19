@@ -81,6 +81,10 @@ Defaults worth knowing:
 
 Inbound sender IDs may also come from a [peer group](./peer-groups.md) whose `channel` is `wecom_ws` or `wecom_ws.<alias>`, instead of the `allowed_*` lists above.
 
+## Kimi Claw
+
+Kimi Claw (kimi.com) is a native channel included in default builds. See the dedicated [Kimi Claw](./kimi-claw.md) guide.
+
 ## DingTalk
 
 Alibaba's enterprise messenger.
