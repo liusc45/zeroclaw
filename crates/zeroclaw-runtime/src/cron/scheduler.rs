@@ -750,9 +750,11 @@ fn partition_by_catch_up_lateness(
     };
     // Compare in whole seconds: building a `chrono::Duration` from an
     // arbitrary `u64` can overflow. `0` skips every overdue job.
-    let max_secs = i64::try_from(max_secs).unwrap_or(i64::MAX);
+    let max_ms = i64::try_from(max_secs)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1000);
     jobs.into_iter()
-        .partition(|job| max_secs > 0 && (now - job.next_run).num_seconds() <= max_secs)
+        .partition(|job| max_ms > 0 && (now - job.next_run).num_milliseconds() <= max_ms)
 }
 
 async fn skip_missed_jobs_on_startup(config: &Config) {
