@@ -26,6 +26,44 @@ pub const BOOTSTRAP_FILES: &[&str] =
 /// lists.
 pub const CONDITIONAL_BOOTSTRAP_FILES: &[&str] = &["BOOTSTRAP.md", "MEMORY.md"];
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
+/// Rewrite the `Model:` field of the `## Runtime` line so the prompt names
+/// the model this turn is actually routed to (classification / effort /
+/// hint route) rather than the agent's startup model. Returns the prompt
+/// unchanged when there is no Runtime line or it already names `model`.
+pub fn with_runtime_model<'a>(prompt: &'a str, model: &str) -> std::borrow::Cow<'a, str> {
+    const HEADER: &str = "## Runtime\n\n";
+    const FIELD: &str = " | Model: ";
+    let model = model.trim();
+    if model.is_empty() {
+        return std::borrow::Cow::Borrowed(prompt);
+    }
+    // The generated Runtime section comes after any bootstrap files, so the
+    // last heading is the real one even if AGENTS.md happens to contain one.
+    let Some(header_at) = prompt.rfind(HEADER) else {
+        return std::borrow::Cow::Borrowed(prompt);
+    };
+    let line_start = header_at + HEADER.len();
+    let line_end = prompt[line_start..]
+        .find(['\n', '\r'])
+        .map_or(prompt.len(), |offset| line_start + offset);
+    let Some(field_offset) = prompt[line_start..line_end].find(FIELD) else {
+        return std::borrow::Cow::Borrowed(prompt);
+    };
+    let value_start = line_start + field_offset + FIELD.len();
+    // Stop at a following ` | ` field so later fields survive.
+    let line_end = prompt[value_start..line_end]
+        .find(" | ")
+        .map_or(line_end, |offset| value_start + offset);
+    if &prompt[value_start..line_end] == model {
+        return std::borrow::Cow::Borrowed(prompt);
+    }
+    let mut out = String::with_capacity(prompt.len() + model.len());
+    out.push_str(&prompt[..value_start]);
+    out.push_str(model);
+    out.push_str(&prompt[line_end..]);
+    std::borrow::Cow::Owned(out)
+}
+
 pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
 
 /// Model-facing `always_ask` exception under Full autonomy.
@@ -1859,5 +1897,47 @@ mod tests {
             !prompt.contains("Full autonomy removes the approval prompt"),
             "must not claim Full unconditionally removes prompts"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_model_rewrite_tests {
+    use super::with_runtime_model;
+
+    #[test]
+    fn rewrites_only_the_runtime_model_field() {
+        let prompt = "## Identity\nModel: keep-me\n\n## Runtime\n\nHost: h | OS: linux | Shell: bash | Model: astra\n\n## Next\nbody";
+        let out = with_runtime_model(prompt, "glm-5.4");
+        assert_eq!(
+            out,
+            "## Identity\nModel: keep-me\n\n## Runtime\n\nHost: h | OS: linux | Shell: bash | Model: glm-5.4\n\n## Next\nbody"
+        );
+    }
+
+    #[test]
+    fn uses_last_runtime_heading_and_keeps_later_fields() {
+        let prompt = "## Runtime\n\nfrom AGENTS.md | Model: fake\n\n## Runtime\n\nHost: h | Model: astra | Extra: 1\n";
+        let out = with_runtime_model(prompt, "gemma-4");
+        assert_eq!(
+            out,
+            "## Runtime\n\nfrom AGENTS.md | Model: fake\n\n## Runtime\n\nHost: h | Model: gemma-4 | Extra: 1\n"
+        );
+    }
+
+    #[test]
+    fn same_model_or_missing_section_is_borrowed() {
+        let prompt = "## Runtime\n\nHost: h | OS: linux | Model: gemma-4\n";
+        assert!(matches!(
+            with_runtime_model(prompt, "gemma-4"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            with_runtime_model("no runtime here", "x"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            with_runtime_model(prompt, "  "),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }
