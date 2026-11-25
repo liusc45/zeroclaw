@@ -679,6 +679,31 @@ async fn catch_up_overdue_jobs(
             return;
         }
     };
+    let (jobs, too_late) =
+        partition_by_catch_up_lateness(jobs, now, config.scheduler.max_catch_up_lateness_secs);
+    for job in &too_late {
+        match skip_missed_run(config, job, now) {
+            Ok(()) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "late_secs": (now - job.next_run).num_seconds(),
+                    })),
+                "Scheduler startup: skipped overdue job past max_catch_up_lateness_secs"
+            ),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "error": format!("{}", e),
+                    })),
+                "Scheduler startup: failed to skip overdue job"
+            ),
+        }
+    }
 
     if jobs.is_empty() {
         ::zeroclaw_log::record!(
@@ -711,6 +736,23 @@ async fn catch_up_overdue_jobs(
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         "Scheduler startup: catch-up complete"
     );
+}
+
+/// Split startup-overdue jobs into (still worth running, too late to run)
+/// by `[scheduler] max_catch_up_lateness_secs`. `None` keeps everything.
+fn partition_by_catch_up_lateness(
+    jobs: Vec<CronJob>,
+    now: DateTime<Utc>,
+    max_lateness_secs: Option<u64>,
+) -> (Vec<CronJob>, Vec<CronJob>) {
+    let Some(max_secs) = max_lateness_secs else {
+        return (jobs, Vec::new());
+    };
+    // Compare in whole seconds: building a `chrono::Duration` from an
+    // arbitrary `u64` can overflow. `0` skips every overdue job.
+    let max_secs = i64::try_from(max_secs).unwrap_or(i64::MAX);
+    jobs.into_iter()
+        .partition(|job| max_secs > 0 && (now - job.next_run).num_seconds() <= max_secs)
 }
 
 async fn skip_missed_jobs_on_startup(config: &Config) {
@@ -1818,6 +1860,43 @@ mod tests {
     ) -> anyhow::Result<tokio::process::Command> {
         let runtime = crate::platform::create_runtime(&config.runtime)?;
         runtime.build_shell_command(command, workspace_dir)
+    }
+
+    #[test]
+    fn catch_up_lateness_bound_splits_overdue_jobs() {
+        let now = Utc::now();
+        let mut fresh = test_job("echo fresh");
+        fresh.id = "fresh".into();
+        fresh.next_run = now - ChronoDuration::minutes(5);
+        let mut stale = test_job("echo stale");
+        stale.id = "stale".into();
+        stale.next_run = now - ChronoDuration::minutes(36);
+
+        let (run, skip) =
+            partition_by_catch_up_lateness(vec![fresh.clone(), stale.clone()], now, None);
+        assert_eq!(run.len(), 2);
+        assert!(skip.is_empty());
+
+        let (run, skip) =
+            partition_by_catch_up_lateness(vec![fresh.clone(), stale.clone()], now, Some(900));
+        assert_eq!(
+            run.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["fresh"]
+        );
+        assert_eq!(
+            skip.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["stale"]
+        );
+
+        let (run, skip) =
+            partition_by_catch_up_lateness(vec![fresh.clone(), stale.clone()], now, Some(0));
+        assert!(run.is_empty());
+        assert_eq!(skip.len(), 2);
+
+        // Huge bounds must not overflow or panic.
+        let (run, skip) = partition_by_catch_up_lateness(vec![fresh, stale], now, Some(u64::MAX));
+        assert_eq!(run.len(), 2);
+        assert!(skip.is_empty());
     }
 
     #[test]
