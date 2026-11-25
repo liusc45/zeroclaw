@@ -679,6 +679,31 @@ async fn catch_up_overdue_jobs(
             return;
         }
     };
+    let (jobs, too_late) =
+        partition_by_catch_up_lateness(jobs, now, config.scheduler.max_catch_up_lateness_secs);
+    for job in &too_late {
+        match skip_missed_run(config, job, now) {
+            Ok(()) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "late_secs": (now - job.next_run).num_seconds(),
+                    })),
+                "Scheduler startup: skipped overdue job past max_catch_up_lateness_secs"
+            ),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "error": format!("{}", e),
+                    })),
+                "Scheduler startup: failed to skip overdue job"
+            ),
+        }
+    }
 
     if jobs.is_empty() {
         ::zeroclaw_log::record!(
@@ -711,6 +736,25 @@ async fn catch_up_overdue_jobs(
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         "Scheduler startup: catch-up complete"
     );
+}
+
+/// Split startup-overdue jobs into (still worth running, too late to run)
+/// by `[scheduler] max_catch_up_lateness_secs`. `None` keeps everything.
+fn partition_by_catch_up_lateness(
+    jobs: Vec<CronJob>,
+    now: DateTime<Utc>,
+    max_lateness_secs: Option<u64>,
+) -> (Vec<CronJob>, Vec<CronJob>) {
+    let Some(max_secs) = max_lateness_secs else {
+        return (jobs, Vec::new());
+    };
+    // Compare in whole seconds: building a `chrono::Duration` from an
+    // arbitrary `u64` can overflow. `0` skips every overdue job.
+    let max_ms = i64::try_from(max_secs)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1000);
+    jobs.into_iter()
+        .partition(|job| max_ms > 0 && (now - job.next_run).num_milliseconds() <= max_ms)
 }
 
 async fn skip_missed_jobs_on_startup(config: &Config) {
@@ -1306,14 +1350,7 @@ async fn run_agent_job_inner(
     };
 
     match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
-                "agent job executed".to_string()
-            } else {
-                response
-            },
-        ),
+        Ok(response) => sanitize_cron_agent_response(&job.id, response),
         Err(e) => {
             let mut error_attributes = ::serde_json::json!({
                 "job_id": job.id,
@@ -1358,6 +1395,46 @@ async fn run_agent_job_inner(
             }
             (false, agent_job_error_message(&e))
         }
+    }
+}
+
+/// Prefix for a run whose final text was only unexecuted tool-call markup.
+/// It is a quiet `NO_REPLY:` sentinel so announce delivery skips it, while
+/// the run itself is recorded as failed.
+const UNPARSED_TOOL_CALL_OUTPUT: &str =
+    "NO_REPLY: agent returned only unexecuted tool-call markup; delivery suppressed";
+
+/// Keep raw tool-call envelopes (`<tool_call…>`, `<function=…>`) that the
+/// model printed as text, and the turn could not execute, from reaching a
+/// human through announce delivery.
+fn sanitize_cron_agent_response(job_id: &str, response: String) -> (bool, String) {
+    if response.trim().is_empty() {
+        return (true, "agent job executed".to_string());
+    }
+    let (cleaned, removed) = zeroclaw_tool_call_parser::strip_tool_call_markup(&response);
+    if !removed {
+        return (true, response);
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Cron)
+            .with_outcome(if cleaned.is_empty() {
+                ::zeroclaw_log::EventOutcome::Failure
+            } else {
+                ::zeroclaw_log::EventOutcome::Success
+            })
+            .with_attrs(::serde_json::json!({
+                "job_id": job_id,
+                "removed_bytes": response.len().saturating_sub(cleaned.len()),
+                "remaining_bytes": cleaned.len(),
+            })),
+        "cron agent output contained raw tool-call markup; stripped before delivery"
+    );
+    if cleaned.is_empty() {
+        (false, UNPARSED_TOOL_CALL_OUTPUT.to_string())
+    } else {
+        (true, cleaned)
     }
 }
 
@@ -1785,6 +1862,70 @@ mod tests {
     ) -> anyhow::Result<tokio::process::Command> {
         let runtime = crate::platform::create_runtime(&config.runtime)?;
         runtime.build_shell_command(command, workspace_dir)
+    }
+
+    #[test]
+    fn catch_up_lateness_bound_splits_overdue_jobs() {
+        let now = Utc::now();
+        let mut fresh = test_job("echo fresh");
+        fresh.id = "fresh".into();
+        fresh.next_run = now - ChronoDuration::minutes(5);
+        let mut stale = test_job("echo stale");
+        stale.id = "stale".into();
+        stale.next_run = now - ChronoDuration::minutes(36);
+
+        let (run, skip) =
+            partition_by_catch_up_lateness(vec![fresh.clone(), stale.clone()], now, None);
+        assert_eq!(run.len(), 2);
+        assert!(skip.is_empty());
+
+        let (run, skip) =
+            partition_by_catch_up_lateness(vec![fresh.clone(), stale.clone()], now, Some(900));
+        assert_eq!(
+            run.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["fresh"]
+        );
+        assert_eq!(
+            skip.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["stale"]
+        );
+
+        let (run, skip) =
+            partition_by_catch_up_lateness(vec![fresh.clone(), stale.clone()], now, Some(0));
+        assert!(run.is_empty());
+        assert_eq!(skip.len(), 2);
+
+        // Huge bounds must not overflow or panic.
+        let (run, skip) = partition_by_catch_up_lateness(vec![fresh, stale], now, Some(u64::MAX));
+        assert_eq!(run.len(), 2);
+        assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn cron_output_with_only_tool_markup_is_failed_and_not_announced() {
+        let raw = "<tool_call_24b82c79>\n<function=send_via>\n<parameter=body>\nToma agua\n</parameter>\n</function>\n</tool_call_24b82c79>";
+        let (ok, out) = sanitize_cron_agent_response("coach_agua", raw.to_string());
+        assert!(!ok);
+        assert!(!announce_delivery_decision(&out).should_deliver());
+    }
+
+    #[test]
+    fn cron_output_with_prose_and_tool_markup_keeps_only_prose() {
+        let raw = "Luis, toma agua.\n<tool_call>\n<function=send_via>\n<parameter=body>\nx\n</parameter>\n</function>\n</tool_call>";
+        let (ok, out) = sanitize_cron_agent_response("coach_agua", raw.to_string());
+        assert!(ok);
+        assert_eq!(out, "Luis, toma agua.");
+        assert!(announce_delivery_decision(&out).should_deliver());
+    }
+
+    #[test]
+    fn cron_output_plain_text_is_unchanged() {
+        let (ok, out) = sanitize_cron_agent_response("j", "Hola Brisa 🍲".to_string());
+        assert!(ok);
+        assert_eq!(out, "Hola Brisa 🍲");
+        let (ok, out) = sanitize_cron_agent_response("j", "  ".to_string());
+        assert!(ok);
+        assert_eq!(out, "agent job executed");
     }
 
     #[test]

@@ -4,6 +4,12 @@ use regex::Regex;
 use std::{collections::HashSet, sync::LazyLock};
 pub use zeroclaw_api::model_provider::strip_think_tags;
 
+mod function_eq;
+pub use function_eq::{
+    looks_like_function_eq_body, normalize_tool_call_tag_variants, parse_function_eq_tool_calls,
+    strip_tool_call_markup,
+};
+
 /// A single parsed tool call extracted from LLM output.
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
@@ -2093,6 +2099,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // these tags can interfere with `<tool_call>` extraction and must be
     // removed first.
     let cleaned = strip_think_tags(response);
+    // Some models wrap calls in `<tool_call_<random id>>`; fold those onto
+    // the canonical tag so the tag loop below recognizes them.
+    let cleaned = normalize_tool_call_tag_variants(&cleaned).into_owned();
     let response = cleaned.as_str();
 
     let mut text_parts = Vec::new();
@@ -2131,6 +2140,17 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         && !minimax_calls.is_empty()
     {
         return (minimax_text, minimax_calls);
+    }
+
+    // Bare function-equals calls with no `<tool_call>` wrapper. Only taken
+    // when an explicit `</function>` closes the block; the runtime still
+    // drops names that are not known, allowed tools.
+    if find_first_tag(response, &TOOL_CALL_OPEN_TAGS).is_none()
+        && response.contains("</function>")
+        && let Some(bare_calls) = parse_function_eq_tool_calls(response)
+    {
+        let (rest, _) = strip_tool_call_markup(response);
+        return (rest, bare_calls);
     }
 
     // Fall back to XML-style tool-call tag parsing.
@@ -2212,6 +2232,12 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 parsed_any = true;
             }
 
+            // Qwen-Coder style `<function=name><parameter=k>v</parameter>`.
+            if !parsed_any && let Some(fn_calls) = parse_function_eq_tool_calls(inner) {
+                calls.extend(fn_calls);
+                parsed_any = true;
+            }
+
             // If JSON parsing failed, try XML format (DeepSeek/GLM style)
             if !parsed_any && let Some(xml_calls) = parse_xml_tool_calls(inner) {
                 calls.extend(xml_calls);
@@ -2257,6 +2283,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
                 if !parsed_any && let Some(call) = parse_malformed_file_write_call(inner) {
                     calls.push(call);
+                    parsed_any = true;
+                }
+
+                if !parsed_any && let Some(fn_calls) = parse_function_eq_tool_calls(inner) {
+                    calls.extend(fn_calls);
                     parsed_any = true;
                 }
 
@@ -2307,6 +2338,13 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
             if let Some(call) = parse_malformed_file_write_call(after_open) {
                 calls.push(call);
+                remaining = "";
+                continue;
+            }
+
+            // Truncated function-equals envelope with no close tag.
+            if let Some(fn_calls) = parse_function_eq_tool_calls(after_open) {
+                calls.extend(fn_calls);
                 remaining = "";
                 continue;
             }
@@ -5610,5 +5648,51 @@ Let me check the result."#;
         assert_eq!(strip_trailing_terminal_markers("<eom>\n"), "");
         assert_eq!(strip_trailing_terminal_markers("<|eom|>  "), "");
         assert_eq!(strip_trailing_terminal_markers("<eom>\n<|eom|>"), "");
+    }
+}
+
+#[cfg(test)]
+mod function_eq_integration_tests {
+    use super::parse_tool_calls;
+
+    #[test]
+    fn parse_tool_calls_recovers_id_suffixed_function_eq_envelope() {
+        let text = "Te aviso.\n<tool_call_24b82c79>\n<function=send_via>\n<parameter=body>\nToma agua\n</parameter>\n<parameter=target>\nwhatsapp.default\n</parameter>\n</function>\n</tool_call_24b82c79>";
+        let (rest, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "send_via");
+        assert_eq!(calls[0].arguments["body"], "Toma agua");
+        assert_eq!(rest, "Te aviso.");
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_damaged_headers() {
+        let text = "<tool_call_24b82c79>\nfunction=memory_recall>\n<parameter=query>\nagua\n</parameter>\nparameter=limit>\n10\n</parameter>\n</function>\n</tool_call_24b82c79>";
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_recall");
+        assert_eq!(calls[0].arguments["limit"], "10");
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_bare_function_eq_call() {
+        let text = "Envío el recordatorio.\n<function=send_via>\n<parameter=body>\nAgua\n</parameter>\n</function>";
+        let (rest, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "send_via");
+        assert_eq!(rest, "Envío el recordatorio.");
+        let (rest, calls) = parse_tool_calls("This function returns x > 0.");
+        assert!(calls.is_empty());
+        assert_eq!(rest, "This function returns x > 0.");
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_unclosed_function_eq_envelope() {
+        let text =
+            "<tool_call>\n<function=shell>\n<parameter=command>\nls\n</parameter>\n</function>";
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls");
     }
 }

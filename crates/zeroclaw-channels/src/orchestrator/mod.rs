@@ -9803,6 +9803,17 @@ async fn process_channel_message_body(
         target_channel.as_ref(),
         per_turn_native_tool_specs_present,
     );
+    // The cached prompt names the startup model. When classification or
+    // effort routing picked another one, say so: the agent is otherwise told
+    // it is a model that is not answering. A different route already has its
+    // own provider-side prompt cache, so this does not cost cache hits.
+    if route_differs_from_startup {
+        system_prompt = zeroclaw_runtime::agent::system_prompt::with_runtime_model(
+            &system_prompt,
+            route.model.as_str(),
+        )
+        .into_owned();
+    }
     if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
     {

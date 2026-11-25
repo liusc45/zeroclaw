@@ -14141,6 +14141,10 @@ impl RiskProfileConfig {
         if self.deny_all_tools {
             return Some(Vec::new());
         }
+        // `allowed_tools = ["*"]` is an explicit "every tool".
+        if crate::policy::allowlist_has_wildcard(&self.allowed_tools) {
+            return None;
+        }
 
         let real = self
             .allowed_tools
@@ -15596,6 +15600,16 @@ pub struct SchedulerConfig {
     /// next scheduled occurrence instead.
     #[serde(default = "default_true")]
     pub catch_up_on_startup: bool,
+    /// Upper bound, in seconds, on how late a startup catch-up run may be.
+    /// Default: unset (no bound — every overdue job fires once).
+    ///
+    /// Only applies when `catch_up_on_startup = true`. An overdue job whose
+    /// `next_run` is further in the past than this is skipped (advanced to
+    /// its next occurrence, one-shots retired) instead of fired, so a
+    /// restart does not deliver stale reminders hours late. Set `0` to
+    /// skip every overdue job, which matches `catch_up_on_startup = false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_catch_up_lateness_secs: Option<u64>,
     /// Maximum number of historical cron run records to retain. Default: `50`.
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
@@ -15620,6 +15634,7 @@ impl Default for SchedulerConfig {
             max_tasks: default_scheduler_max_tasks(),
             max_concurrent: default_scheduler_max_concurrent(),
             catch_up_on_startup: true,
+            max_catch_up_lateness_secs: None,
             max_run_history: default_max_run_history(),
         }
     }
@@ -34466,6 +34481,7 @@ recipient = "42"
         let s = SchedulerConfig::default();
         assert!(s.enabled);
         assert!(s.catch_up_on_startup);
+        assert_eq!(s.max_catch_up_lateness_secs, None);
         assert_eq!(s.max_run_history, 50);
     }
 
@@ -34476,12 +34492,14 @@ recipient = "42"
             max_tasks: 16,
             max_concurrent: 2,
             catch_up_on_startup: false,
+            max_catch_up_lateness_secs: Some(900),
             max_run_history: 100,
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: SchedulerConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.enabled);
         assert!(!parsed.catch_up_on_startup);
+        assert_eq!(parsed.max_catch_up_lateness_secs, Some(900));
         assert_eq!(parsed.max_run_history, 100);
     }
 
