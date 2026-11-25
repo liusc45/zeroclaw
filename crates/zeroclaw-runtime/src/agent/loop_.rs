@@ -277,6 +277,68 @@ fn effort_turn_route(
     }))
 }
 
+/// Route picked by `[query_classification]` for a one-shot run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClassifiedTurnRoute {
+    model_provider: String,
+    model: String,
+}
+
+/// Apply `[query_classification]` to a one-shot run (cron, CLI `-m`), the
+/// same way the channel orchestrator does for inbound messages. Returns
+/// `None` when classification is off, no rule matches, or the matched hint
+/// has no `[[model_routes]]` entry.
+fn classified_turn_route(config: &Config, message: &str) -> Option<ClassifiedTurnRoute> {
+    // Cron prompts arrive as `[cron:<id> <name>] <prompt>`; classify only the
+    // prompt so job ids/names do not trigger keyword rules or skew lengths.
+    let message = message
+        .strip_prefix("[cron:")
+        .and_then(|rest| rest.split_once("] "))
+        .map_or(message, |(_, prompt)| prompt);
+    let decision =
+        crate::agent::classifier::classify_with_decision(&config.query_classification, message)?;
+    let route = config
+        .model_routes
+        .iter()
+        .find(|route| route.hint.eq_ignore_ascii_case(&decision.hint))?;
+    if route.model_provider.trim().is_empty() || route.model.trim().is_empty() {
+        return None;
+    }
+    // A one-shot run resolves credentials from the provider profile; it has
+    // no slot for a per-route key. Rather than authenticate a keyed route
+    // with the profile's key, keep the default route.
+    if route
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"hint": decision.hint.as_str()})),
+            "One-shot classification matched a route with its own api_key; keeping default route"
+        );
+        return None;
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "hint": decision.hint.as_str(),
+                "model_provider": route.model_provider.as_str(),
+                "model": route.model.as_str(),
+                "rule_priority": decision.priority,
+                "message_length": message.len(),
+            })
+        ),
+        "One-shot run classified — overriding route"
+    );
+    Some(ClassifiedTurnRoute {
+        model_provider: route.model_provider.trim().to_string(),
+        model: route.model.trim().to_string(),
+    })
+}
+
 fn effort_scoped_provider_config(
     config: &Config,
     allowed_provider_refs: &HashSet<String>,
@@ -457,7 +519,8 @@ pub fn apply_policy_tool_filter(
     tools.retain(|t| {
         let name = t.name();
         let policy_ok = policy.is_none_or(|p| p.is_tool_allowed(name));
-        let caller_ok = caller_allowed.is_none_or(|list| list.iter().any(|n| n == name));
+        let caller_ok =
+            caller_allowed.is_none_or(|list| zeroclaw_config::policy::allowlist_admits(list, name));
         policy_ok && caller_ok
     });
 }
@@ -644,7 +707,7 @@ pub fn filter_by_allowed_tools(
         None => specs,
         Some(list) => specs
             .into_iter()
-            .filter(|spec| list.iter().any(|name| name == &spec.name))
+            .filter(|spec| zeroclaw_config::policy::allowlist_admits(list, &spec.name))
             .collect(),
     }
 }
@@ -1634,6 +1697,9 @@ async fn run_inner(
     mut overrides: AgentRunOverrides,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
+    // `allowed_tools = ["*"]` (e.g. on a cron job) means every tool; the
+    // registry assembly compares names exactly, so collapse it to `None`.
+    let allowed_tools = zeroclaw_config::policy::normalize_tool_allowlist(allowed_tools);
     let execution_admission = if let Some(admission) = overrides.execution_admission.take() {
         Some(admission)
     } else if let Some(capability) = overrides.execution_capability.as_ref() {
@@ -1959,6 +2025,12 @@ async fn run_inner(
                     selection.allowed_provider_refs.as_ref(),
                 ));
                 active_effort_provider_refs = Some(selection.allowed_provider_refs);
+            } else if let Some(route) = classified_turn_route(&config, effective_message.as_ref()) {
+                // Same rule channels apply to inbound messages, so cron and
+                // other one-shot runs without an explicit model are routed
+                // by `[query_classification]` too.
+                provider_name = route.model_provider;
+                model_name = route.model;
             }
         }
         let mut context_limits =
@@ -4440,11 +4512,58 @@ mod tests {
     }
 
     use super::{
-        apply_text_tool_prompt_policy, effort_scoped_provider_config, effort_turn_route,
-        estimate_history_tokens, load_interactive_session_history, make_query_summary,
-        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
-        seed_channel_handles, truncate_tool_result,
+        apply_text_tool_prompt_policy, classified_turn_route, effort_scoped_provider_config,
+        effort_turn_route, estimate_history_tokens, load_interactive_session_history,
+        make_query_summary, maybe_inject_channel_delivery_defaults,
+        save_interactive_session_history, seed_channel_handles, truncate_tool_result,
     };
+
+    #[test]
+    fn classified_turn_route_applies_query_classification_to_one_shot_runs() {
+        use zeroclaw_config::schema::{
+            ClassificationRule, Config, ModelRouteConfig, QueryClassificationConfig,
+        };
+
+        let mut config = Config::default();
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "search".into(),
+            model_provider: "custom.zai".into(),
+            model: "glm-5.4".into(),
+            api_key: None,
+        }];
+        config.query_classification = QueryClassificationConfig {
+            enabled: true,
+            rules: vec![
+                ClassificationRule {
+                    hint: "search".into(),
+                    keywords: vec!["busca".into()],
+                    ..ClassificationRule::default()
+                },
+                ClassificationRule {
+                    hint: "missing-route".into(),
+                    keywords: vec!["huérfana".into()],
+                    ..ClassificationRule::default()
+                },
+            ],
+        };
+
+        let route = classified_turn_route(&config, "[cron:x resumen] Busca el clima de hoy")
+            .expect("keyword rule should route");
+        assert_eq!(route.model_provider, "custom.zai");
+        assert_eq!(route.model, "glm-5.4");
+
+        assert!(classified_turn_route(&config, "hola").is_none());
+        // The cron wrapper (job id / name) is not classified.
+        assert!(classified_turn_route(&config, "[cron:busca busca] hola").is_none());
+        assert!(classified_turn_route(&config, "regla huérfana").is_none());
+
+        config.model_routes[0].api_key = Some("route-key".into());
+        assert!(classified_turn_route(&config, "busca algo").is_none());
+        config.model_routes[0].api_key = None;
+
+        config.query_classification.enabled = false;
+        assert!(classified_turn_route(&config, "busca algo").is_none());
+    }
 
     #[test]
     fn effort_turn_route_limits_local_and_cloud_provider_attempts() {
@@ -18786,6 +18905,14 @@ Let me check the result."#;
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names.len(), 1);
         assert!(names.contains(&"shell"));
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_wildcard_passes_all() {
+        let specs = vec![make_spec("a"), make_spec("b")];
+        let allowed = vec!["*".to_string()];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        assert_eq!(result.len(), 2);
     }
 
     #[test]
