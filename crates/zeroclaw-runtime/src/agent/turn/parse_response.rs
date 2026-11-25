@@ -142,6 +142,47 @@ fn recover_structured_arguments(
     {
         return;
     }
+    // `"type": "integer"` or a nullable `"type": ["integer", "null"]`.
+    let scalar_type = match schema.get("type") {
+        Some(Value::String(kind)) => Some(kind.as_str()),
+        Some(Value::Array(kinds)) => {
+            let mut non_null = kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|kind| *kind != "null");
+            match (non_null.next(), non_null.next()) {
+                (Some(kind), None) => Some(kind),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let (Some(scalar @ ("boolean" | "integer" | "number")), Value::String(text)) =
+        (scalar_type, &*value)
+    {
+        // Text-protocol fallbacks (e.g. `<parameter=limit>10</parameter>`)
+        // carry every argument as a string. Coerce only unambiguous scalars.
+        let text = text.trim();
+        let coerced = match scalar {
+            "boolean" if text.eq_ignore_ascii_case("true") => Some(Value::Bool(true)),
+            "boolean" if text.eq_ignore_ascii_case("false") => Some(Value::Bool(false)),
+            "integer" => text
+                .parse::<i64>()
+                .map(Value::from)
+                .or_else(|_| text.parse::<u64>().map(Value::from))
+                .ok(),
+            "number" => text
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(Value::Number),
+            _ => None,
+        };
+        if let Some(coerced) = coerced {
+            *value = coerced;
+        }
+        return;
+    }
     let Some(kind @ ("object" | "array")) = schema.get("type").and_then(Value::as_str) else {
         return;
     };
@@ -917,6 +958,32 @@ mod argument_preservation_tests {
             recover_structured_arguments(&mut value, &schema, 0);
             assert_eq!(value, input, "schema: {schema}");
         }
+    }
+
+    #[test]
+    fn text_protocol_scalar_strings_are_coerced_by_schema() {
+        let schema = json!({"type":"object", "properties":{
+            "limit":{"type":"integer"}, "case_sensitive":{"type":"boolean"},
+            "ratio":{"type":"number"}, "query":{"type":"string"}
+        }});
+        let mut value = json!({
+            "limit":"10", "case_sensitive":"False", "ratio":"2.5", "query":"10"
+        });
+        recover_structured_arguments(&mut value, &schema, 0);
+        assert_eq!(
+            value,
+            json!({
+                "limit":10, "case_sensitive":false, "ratio":2.5, "query":"10"
+            })
+        );
+        let nullable = json!({"type":"object", "properties":{"limit":{"type":["integer","null"]}}});
+        let mut value = json!({"limit":"7"});
+        recover_structured_arguments(&mut value, &nullable, 0);
+        assert_eq!(value, json!({"limit":7}));
+        // Ambiguous scalars stay strings for the tool's own validation.
+        let mut bad = json!({"limit":"ten", "case_sensitive":"maybe"});
+        recover_structured_arguments(&mut bad, &schema, 0);
+        assert_eq!(bad, json!({"limit":"ten", "case_sensitive":"maybe"}));
     }
 
     #[test]
