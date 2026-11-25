@@ -26,11 +26,13 @@ impl ToolAccessPolicy {
         excluded_tools: Option<&[String]>,
         caller_allowed: Option<&[String]>,
     ) -> Option<Self> {
+        use zeroclaw_config::policy::allowlist_has_wildcard;
         let mut policy = Self::default();
-        if let Some(list) = allowed_tools {
+        // A `"*"` entry means "every tool": treat it as no allowlist.
+        if let Some(list) = allowed_tools.filter(|list| !allowlist_has_wildcard(list)) {
             policy.allowed = Some(list.to_vec());
         }
-        if let Some(caller) = caller_allowed {
+        if let Some(caller) = caller_allowed.filter(|list| !allowlist_has_wildcard(list)) {
             policy.caller_allowed = Some(caller.to_vec());
         }
         if let Some(list) = excluded_tools {

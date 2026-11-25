@@ -14141,6 +14141,10 @@ impl RiskProfileConfig {
         if self.deny_all_tools {
             return Some(Vec::new());
         }
+        // `allowed_tools = ["*"]` is an explicit "every tool".
+        if crate::policy::allowlist_has_wildcard(&self.allowed_tools) {
+            return None;
+        }
 
         let real = self
             .allowed_tools

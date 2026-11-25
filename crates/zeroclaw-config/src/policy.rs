@@ -391,7 +391,7 @@ impl SecurityPolicy {
         let allowed = self
             .allowed_tools
             .as_ref()
-            .is_none_or(|list| list.iter().any(|t| t == name));
+            .is_none_or(|list| allowlist_admits(list, name));
         allowed && !self.is_tool_excluded(name)
     }
 
@@ -400,6 +400,31 @@ impl SecurityPolicy {
             .as_ref()
             .is_some_and(|list| list.iter().any(|t| t == name))
     }
+}
+
+/// Allowlist entry meaning "every tool" (`allowed_tools = ["*"]`).
+pub const TOOL_ALLOWLIST_WILDCARD: &str = "*";
+
+/// True when an allowlist contains the `"*"` wildcard entry.
+#[must_use]
+pub fn allowlist_has_wildcard(list: &[String]) -> bool {
+    list.iter()
+        .any(|entry| entry.trim() == TOOL_ALLOWLIST_WILDCARD)
+}
+
+/// Whether `name` is admitted by an explicit allowlist: an exact entry or
+/// the `"*"` wildcard. An empty list admits nothing.
+#[must_use]
+pub fn allowlist_admits(list: &[String], name: &str) -> bool {
+    list.iter()
+        .any(|entry| entry == name || entry.trim() == TOOL_ALLOWLIST_WILDCARD)
+}
+
+/// Collapse a wildcard allowlist to `None` ("unrestricted") so call sites
+/// that compare names exactly treat `["*"]` as allow-all.
+#[must_use]
+pub fn normalize_tool_allowlist(list: Option<Vec<String>>) -> Option<Vec<String>> {
+    list.filter(|entries| !allowlist_has_wildcard(entries))
 }
 
 /// Default allowed commands for Unix platforms.
@@ -6003,6 +6028,24 @@ mod tests {
         assert!(p.is_tool_allowed("shell"));
         assert!(p.is_tool_allowed("spawn_subagent"));
         assert!(p.is_tool_allowed("anything_else"));
+    }
+
+    #[test]
+    fn is_tool_allowed_wildcard_admits_everything_but_excluded() {
+        let p = SecurityPolicy {
+            allowed_tools: Some(vec!["*".into()]),
+            excluded_tools: Some(vec!["shell".into()]),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_tool_allowed("memory_recall"));
+        assert!(p.is_tool_allowed("send_via"));
+        assert!(!p.is_tool_allowed("shell"));
+        assert_eq!(normalize_tool_allowlist(Some(vec!["*".into()])), None);
+        assert_eq!(
+            normalize_tool_allowlist(Some(vec!["shell".into()])),
+            Some(vec!["shell".to_string()])
+        );
+        assert_eq!(normalize_tool_allowlist(Some(vec![])), Some(vec![]));
     }
 
     #[test]
