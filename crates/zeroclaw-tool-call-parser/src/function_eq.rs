@@ -29,7 +29,7 @@ use crate::ParsedToolCall;
 /// `<tool_call_<id>>` / `</tool_call_<id>>` (and `tool-call` / `toolcall`
 /// spellings) with an id suffix.
 static ID_SUFFIXED_TOOL_CALL_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<(/?)tool[_-]?call[_-]([A-Za-z0-9][A-Za-z0-9_-]{0,63})>").expect("valid regex")
+    Regex::new(r"(?i)<(/?)tool[_-]?call[_-]([A-Za-z_-]*[0-9][A-Za-z0-9_-]*)>").expect("valid regex")
 });
 
 /// A function header. Accepted forms: `<function=name>`, `<function name>`,
@@ -47,6 +47,14 @@ static FUNCTION_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
 static PARAMETER_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?m)(?:<parameter(?:[ \t]*=[ \t]*|[ \t]+)|^[ \t]*parameter[ \t]*=[ \t]*)([A-Za-z_][A-Za-z0-9_.\-]{0,127})[ \t]*>",
+    )
+    .expect("valid regex")
+});
+
+/// `<parameter=k>` / `<parameter k>` (with the `<`) at a line start.
+static BRACKETED_PARAMETER_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^[ \t]*<parameter(?:[ \t]*=[ \t]*|[ \t]+)[A-Za-z_][A-Za-z0-9_.\-]{0,127}[ \t]*>",
     )
     .expect("valid regex")
 });
@@ -137,9 +145,17 @@ fn parse_parameters(
             return (args, text.len());
         };
         let value_start = whole.end();
-        let (value_end, resume) = match find_ci(text, PARAMETER_CLOSE, value_start) {
-            Some(close) => (close, close + PARAMETER_CLOSE.len()),
-            None => {
+        let close = find_ci(text, PARAMETER_CLOSE, value_start);
+        // A bracketed `<parameter=..>` header at a line start before this
+        // value's close means the close is missing: end the value there.
+        let next_bracketed = BRACKETED_PARAMETER_LINE_RE
+            .find_at(text, value_start)
+            .map(|m| m.start())
+            .filter(|at| close.is_none_or(|close| *at < close));
+        let (value_end, resume) = match (close, next_bracketed) {
+            (_, Some(next)) => (next, next),
+            (Some(close), None) => (close, close + PARAMETER_CLOSE.len()),
+            (None, None) => {
                 // Truncated value: stop at the next header or the end.
                 let next = [
                     PARAMETER_HEADER_RE
@@ -157,6 +173,9 @@ fn parse_parameters(
                 (next, next)
             }
         };
+        if resume <= cursor {
+            return (args, text.len());
+        }
         args.insert(
             key.as_str().to_string(),
             serde_json::Value::String(trim_value(&text[value_start..value_end]).to_string()),
@@ -185,11 +204,11 @@ fn tail_is_markup(tail: &str) -> bool {
 }
 
 static TOOL_CALL_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<tool[_-]?call(?:s|[_-][A-Za-z0-9][A-Za-z0-9_-]{0,63})?>")
+    Regex::new(r"(?i)<tool[_-]?call(?:s|[_-][A-Za-z_-]*[0-9][A-Za-z0-9_-]*)?>")
         .expect("valid regex")
 });
 static TOOL_CALL_CLOSE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)</tool[_-]?call(?:s|[_-][A-Za-z0-9][A-Za-z0-9_-]{0,63})?>")
+    Regex::new(r"(?i)</tool[_-]?call(?:s|[_-][A-Za-z_-]*[0-9][A-Za-z0-9_-]*)?>")
         .expect("valid regex")
 });
 static EMPTY_FENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -232,12 +251,13 @@ pub fn strip_tool_call_markup(text: &str) -> (String, bool) {
     let mut cursor = 0;
     while let Some(header) = FUNCTION_HEADER_RE.find_at(&pass1, cursor) {
         let after = header.end();
-        if let Some(close) = find_ci(&pass1, FUNCTION_CLOSE, after) {
+        // Walk parameters the same way the parser does, so a literal
+        // `</function>` inside a value does not end the block early.
+        let (args, end) = parse_parameters(&pass1, after);
+        let closed = pass1[..end].to_ascii_lowercase().ends_with(FUNCTION_CLOSE);
+        if closed || !args.is_empty() {
             out.push_str(&pass1[cursor..header.start()]);
-            cursor = close + FUNCTION_CLOSE.len();
-        } else if PARAMETER_HEADER_RE.is_match(&pass1[after..]) {
-            out.push_str(&pass1[cursor..header.start()]);
-            cursor = pass1.len();
+            cursor = end;
         } else {
             out.push_str(&pass1[cursor..after]);
             cursor = after;
@@ -245,7 +265,13 @@ pub fn strip_tool_call_markup(text: &str) -> (String, bool) {
     }
     out.push_str(&pass1[cursor..]);
 
-    let out = EMPTY_FENCE_RE.replace_all(&out, "");
+    // Only tidy fences when a call was actually removed.
+    let changed = out.trim() != text.trim();
+    let out = if changed {
+        EMPTY_FENCE_RE.replace_all(&out, "")
+    } else {
+        Cow::Borrowed(out.as_str())
+    };
     let cleaned = out.trim().to_string();
     let removed = cleaned != text.trim();
     (cleaned, removed)
@@ -324,14 +350,43 @@ mod tests {
     }
 
     #[test]
+    fn missing_parameter_close_does_not_swallow_next_parameter() {
+        let body = "<function=send_via>\n<parameter=body>\nToma agua\n<parameter=target>\nwhatsapp.default\n</parameter>\n</function>";
+        let calls = parse_function_eq_tool_calls(body).unwrap();
+        assert_eq!(calls[0].arguments["body"], "Toma agua");
+        assert_eq!(calls[0].arguments["target"], "whatsapp.default");
+    }
+
+    #[test]
+    fn literal_function_close_inside_value_is_stripped_with_the_block() {
+        let text = "Ok.\n<function=file_write>\n<parameter=content>\nuse </function> here\n</parameter>\n</function>\nFin.";
+        let (clean, removed) = strip_tool_call_markup(text);
+        assert!(removed);
+        assert_eq!(clean, "Ok.\n\nFin.");
+    }
+
+    #[test]
+    fn untouched_text_keeps_empty_fences_and_tag_like_words() {
+        let text = "```\n```";
+        let (clean, removed) = strip_tool_call_markup(text);
+        assert!(!removed);
+        assert_eq!(clean, text);
+        let text = "El campo <tool_call_id>abc</tool_call_id> identifica la llamada.";
+        let (clean, removed) = strip_tool_call_markup(text);
+        assert!(!removed);
+        assert_eq!(clean, text);
+        assert_eq!(normalize_tool_call_tag_variants(text), text);
+    }
+
+    #[test]
     fn header_shaped_text_inside_a_value_stays_in_the_value() {
-        let body = "<function=file_write>\n<parameter=content>\nline1\n<function=shell>\nparameter=x>\n</parameter>\n<parameter=path>\na.md\n</parameter>\n</function>";
+        let body = "<function=file_write>\n<parameter=content>\nline1\n<function=shell>\n  parameter=x>\n</parameter>\n<parameter=path>\na.md\n</parameter>\n</function>";
         let calls = parse_function_eq_tool_calls(body).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "file_write");
         assert_eq!(
             calls[0].arguments["content"],
-            "line1\n<function=shell>\nparameter=x>"
+            "line1\n<function=shell>\n  parameter=x>"
         );
         assert_eq!(calls[0].arguments["path"], "a.md");
     }

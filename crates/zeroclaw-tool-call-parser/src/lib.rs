@@ -2142,6 +2142,17 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         return (minimax_text, minimax_calls);
     }
 
+    // Bare function-equals calls with no `<tool_call>` wrapper. Only taken
+    // when an explicit `</function>` closes the block; the runtime still
+    // drops names that are not known, allowed tools.
+    if find_first_tag(response, &TOOL_CALL_OPEN_TAGS).is_none()
+        && response.contains("</function>")
+        && let Some(bare_calls) = parse_function_eq_tool_calls(response)
+    {
+        let (rest, _) = strip_tool_call_markup(response);
+        return (rest, bare_calls);
+    }
+
     // Fall back to XML-style tool-call tag parsing.
     while let Some((start, open_tag)) = find_first_tag(remaining, &TOOL_CALL_OPEN_TAGS) {
         // Everything before the tag is text
@@ -5661,6 +5672,18 @@ mod function_eq_integration_tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "memory_recall");
         assert_eq!(calls[0].arguments["limit"], "10");
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_bare_function_eq_call() {
+        let text = "Envío el recordatorio.\n<function=send_via>\n<parameter=body>\nAgua\n</parameter>\n</function>";
+        let (rest, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "send_via");
+        assert_eq!(rest, "Envío el recordatorio.");
+        let (rest, calls) = parse_tool_calls("This function returns x > 0.");
+        assert!(calls.is_empty());
+        assert_eq!(rest, "This function returns x > 0.");
     }
 
     #[test]
